@@ -95,6 +95,30 @@ sequenceDiagram
     EC2 Instance (public)->>VPC Resources: forwarded traffic
 ```
 
+## Install
+
+Via [ricardoleal/homebrew-tap](https://github.com/ricardoleal/homebrew-tap):
+
+```bash
+brew tap ricardoleal/tap
+brew install bastionctl
+```
+
+For SSM-brokered targets (no public IP) you also need:
+
+```bash
+brew install --cask session-manager-plugin
+```
+
+and a `~/.ssh/config` entry:
+
+```
+Host i-* mi-*
+    ProxyCommand sh -c "aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters 'portNumber=%p'"
+```
+
+See: https://github.com/ricardoleal/bastionctl#prerequisites-for-ssm-brokered-targets
+
 ## Build
 
 ```bash
