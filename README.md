@@ -167,6 +167,45 @@ Connections are stored per account:
 arrow keys (or `j`/`k`) and Enter; Space toggles a CIDR in the network
 selector.
 
+### Manual configuration
+
+Prefer to skip discovery? Write the connection file by hand at
+`~/.config/bastionctl/accounts/<account-id>/<connection>.yaml`
+(`account_id` must match the directory, `chmod 600`):
+
+```yaml
+# ~/.config/bastionctl/accounts/123456789012/corp.yaml
+name: corp
+kind: vpc                        # vpc | dedicated
+account_id: "123456789012"
+region: eu-central-1
+vpc_id: vpc-0abc123
+vpc_cidrs:
+  - 10.0.0.0/16
+subnet_id: subnet-0abc123
+instance_id: i-0abc123
+name_tag: pivot
+routes:
+  - cidr: 10.0.0.0/16
+    source: pivot_vpc
+    selected: true
+connection_method: ssm            # ssm | direct_ip
+target: i-0abc123                # instance ID for ssm, IP address for direct_ip
+ssh_port: 22
+```
+
+For `direct_ip` targets, point `target` at the IP and set credentials:
+
+```yaml
+connection_method: direct_ip
+target: 52.10.20.30
+ssh_user: ec2-user
+ssh_key_path: ~/.ssh/corp.pem
+```
+
+For `ssm` targets, leave `ssh_user`/`ssh_key_path` blank to keep using
+your `~/.ssh/config` as-is.
+
 ## IAM Permissions (read-only)
 
 ```
