@@ -160,8 +160,7 @@ func (m connectionModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.table.SetWidth(max(message.Width, 40))
 		m.table.SetHeight(max(message.Height-7, 4))
-		m.table.SetRows(connectionRows(m.choices, message.Width))
-		m.table.SetColumns(connectionColumns(message.Width))
+		safeSetColumnsRows(&m.table, connectionColumns(message.Width), connectionRows(m.choices, message.Width))
 		return m, nil
 	case tea.KeyMsg:
 		switch message.String() {
@@ -232,6 +231,23 @@ func sharedTableStyles() table.Styles {
 	return styles
 }
 
+// safeSetColumnsRows updates a bubbles table's columns and rows without tripping
+// the table's renderRow panic on mismatched widths.
+//
+// bubbles/table renderRow iterates over the row cells and indexes into columns,
+// so any intermediate state where a row has more cells than there are columns
+// panics (index out of range). Growing the column count therefore requires
+// SetColumns before SetRows, while shrinking requires the reverse order.
+func safeSetColumnsRows(t *table.Model, cols []table.Column, rows []table.Row) {
+	if len(cols) >= len(t.Columns()) {
+		t.SetColumns(cols)
+		t.SetRows(rows)
+		return
+	}
+	t.SetRows(rows)
+	t.SetColumns(cols)
+}
+
 func SelectCandidate(candidates []probe.Candidate) (int, bool, error) {
 	if len(candidates) == 0 {
 		return 0, true, nil
@@ -283,8 +299,7 @@ func (m candidateModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = message.Width
 		m.table.SetWidth(max(message.Width, 40))
 		m.table.SetHeight(max(message.Height-7, 4))
-		m.table.SetRows(candidateRows(m.candidates, message.Width))
-		m.table.SetColumns(candidateColumns(message.Width))
+		safeSetColumnsRows(&m.table, candidateColumns(message.Width), candidateRows(m.candidates, message.Width))
 		return m, nil
 	case tea.KeyMsg:
 		switch message.String() {

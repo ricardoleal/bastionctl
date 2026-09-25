@@ -57,6 +57,28 @@ func TestCandidateTableScrollsWithSelection(t *testing.T) {
 	}
 }
 
+func TestCandidateTableResizeAcrossColumnBuckets(t *testing.T) {
+	candidates := make([]probe.Candidate, 9)
+	for index := range candidates {
+		candidates[index] = probe.Candidate{
+			Name:       "pivot",
+			InstanceID: "i-123",
+			VpcID:      "vpc-123",
+			VpcCIDRs:   []string{"10.0.0.0/16"},
+			Method:     probe.MethodSSM,
+			Reachable:  true,
+		}
+	}
+	// newCandidateModel starts at width 120 (5 columns). Resizing to a width
+	// with more columns (6) or fewer (3) must not panic the bubbles table.
+	model := newCandidateModel(candidates)
+	for _, width := range []int{150, 70, 200, 120} {
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: width, Height: 30})
+		model = updated.(candidateModel)
+		_ = model.View()
+	}
+}
+
 func TestConnectionTableRendersStatusAndSelectsRow(t *testing.T) {
 	choices := []ConnectionChoice{
 		{Status: "[Running:123]", Name: "analytics", Kind: "vpc", Region: "eu-central-1", Networks: "10.0.0.0/16"},
