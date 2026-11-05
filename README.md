@@ -1,4 +1,3 @@
-# bastionctl
 ![Social Banner](.github/social/bastionctl-social.png)
 
 Finds, tests, and remembers the best EC2 instance to use as an `sshuttle`
