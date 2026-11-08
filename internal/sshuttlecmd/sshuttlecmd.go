@@ -206,6 +206,14 @@ func BackgroundStatus(pidFile string) (int, bool, error) {
 		return 0, false, err
 	}
 	if !isSSHuttleCommand(command) {
+		// The process may have exited while it was being inspected (a
+		// momentary corpse: ps shows it bracketed or not at all while the
+		// liveness check still saw it). Verify once more before declaring
+		// the PID foreign; a dead process is just a stale PID file.
+		if alive, err := processAlive(process); err == nil && !alive {
+			_ = os.Remove(pidFile)
+			return pid, false, nil
+		}
 		return 0, false, fmt.Errorf("PID %d is not sshuttle (%s)", pid, strings.TrimSpace(command))
 	}
 	return pid, true, nil
@@ -255,6 +263,13 @@ func processAlive(process *os.Process) (bool, error) {
 func processCommand(pid int) (string, error) {
 	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
 	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			// ps exits 1 when the process no longer exists: it died between
+			// the liveness check and this inspection. Report nothing; the
+			// caller re-checks liveness and treats it as a stale PID file.
+			return "", nil
+		}
 		return "", fmt.Errorf("inspecting PID %d: %w", pid, err)
 	}
 	return string(out), nil

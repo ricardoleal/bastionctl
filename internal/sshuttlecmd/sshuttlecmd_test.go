@@ -234,10 +234,15 @@ func TestWaitForPIDFileHandlesDelayedWrite(t *testing.T) {
 func TestStopBackgroundTerminatesRecordedSSHuttleProcess(t *testing.T) {
 	dir := t.TempDir()
 	sshuttlePath := filepath.Join(dir, "sshuttle")
-	if err := os.Symlink("/bin/sleep", sshuttlePath); err != nil {
+	// /bin/sh, not /bin/sleep: on newer runner images (e.g. Ubuntu 26.04's
+	// uutils coreutils) /bin/sleep dispatches on argv[0], and our "sshuttle"
+	// symlink would make it exit instantly. sh -c keeps a stable sleeper;
+	// the "|| true" stops sh from exec-replacing itself (which would hide
+	// the sshuttle argv[0] from the ps inspection).
+	if err := os.Symlink("/bin/sh", sshuttlePath); err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(sshuttlePath, "30")
+	command := exec.Command(sshuttlePath, "-c", "sleep 30 || true")
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
