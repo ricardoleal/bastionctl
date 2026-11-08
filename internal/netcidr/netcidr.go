@@ -53,6 +53,45 @@ func Normalize(cidr string) (string, error) {
 	return prefix.Masked().String(), nil
 }
 
+// SecondIPv4Host returns the second address of an IPv4 prefix's network
+// range (e.g. "10.0.0.0/16" -> "10.0.0.2"), which is how AWS exposes the
+// VPC DNS resolver ("+2" rule). /31 and /32 guests have no such address,
+// and IPv6 prefixes are rejected outright.
+func SecondIPv4Host(cidr string) (netip.Addr, error) {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
+	}
+	if !prefix.Addr().Is4() {
+		return netip.Addr{}, fmt.Errorf("CIDR %q is not an IPv4 prefix", cidr)
+	}
+	if prefix.Bits() >= 31 {
+		return netip.Addr{}, fmt.Errorf("CIDR %q is too small to hold an AWS DNS address", cidr)
+	}
+	host := prefix.Masked().Addr().Next().Next()
+	if !prefix.Contains(host) {
+		return netip.Addr{}, fmt.Errorf("CIDR %q has no usable AWS DNS address", cidr)
+	}
+	return host, nil
+}
+
+// Contains reports whether any prefix in cidrs contains addr.
+func Contains(cidrs []string, addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	for _, cidr := range cidrs {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			continue
+		}
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
 func NormalizeUnique(cidrs []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(cidrs))
 	result := make([]string, 0, len(cidrs))

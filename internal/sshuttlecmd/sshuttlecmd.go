@@ -7,6 +7,9 @@
 package sshuttlecmd
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -43,6 +46,7 @@ func BuildArgs(cfg *config.Config) []string {
 
 	args := []string{"-r", hostArg}
 	args = append(args, cfg.SelectedCIDRs()...)
+	args = append(args, DNSArgs(cfg.EffectiveDNSConfig())...)
 
 	needsOverride := cfg.SSHKeyPath != "" || (cfg.SSHPort != 0 && cfg.SSHPort != 22)
 	if needsOverride {
@@ -58,13 +62,48 @@ func BuildArgs(cfg *config.Config) []string {
 	return args
 }
 
+// DNSArgs maps a connection's DNS settings onto sshuttle flags:
+//
+//	off:   nothing (historical behavior).
+//	all:   --dns [ --to-ns IP[:PORT] ]  — capture every query to the local
+//	       system resolvers and resolve on the remote side.
+//	split: --ns-hosts IP[,IP] [ --to-ns IP[:PORT] ]  — capture only queries
+//	       sent to the listed resolver IPs (the OS resolver is responsible
+//	       for sending only the split domains to them).
+func DNSArgs(d *config.DNSConfig) []string {
+	if d == nil {
+		return nil
+	}
+	switch d.EffectiveMode() {
+	case config.DNSModeAll:
+		args := []string{"--dns"}
+		if d.ToNS != "" {
+			args = append(args, "--to-ns", d.ToNS)
+		}
+		return args
+	case config.DNSModeSplit:
+		args := []string{"--ns-hosts", strings.Join(d.Resolver, ",")}
+		if d.ToNS != "" {
+			args = append(args, "--to-ns", d.ToNS)
+		}
+		return args
+	default:
+		return nil
+	}
+}
+
 // PrintCommand prints the full command line for the user to copy/run
 // themselves (the default behavior -- see design notes on why we don't
 // auto-launch by default).
 func PrintCommand(bin string, args []string) {
-	full := bin + " " + strings.Join(quoteArgs(args), " ")
+	full := CommandPreview(bin, args)
 	fmt.Println("\nReady to establish the tunnel. Run:")
 	fmt.Println("  " + full)
+}
+
+// CommandPreview returns the full sshuttle command as a copy-pasteable string.
+func CommandPreview(bin string, args []string) string {
+	return bin + " " + strings.Join(quoteArgs(args), " ")
 }
 
 // Launch executes sshuttle as the current user so its SSH child retains
@@ -92,6 +131,23 @@ func StartBackground(bin string, args []string, pidFile string) (int, error) {
 	}
 
 	return waitForPIDFile(pidFile, 2*time.Second)
+}
+
+// StartBackgroundCaptured starts sshuttle without inheriting the interactive
+// terminal and returns any startup output for an in-app caller to display.
+func StartBackgroundCaptured(ctx context.Context, bin string, args []string, pidFile string) (int, string, error) {
+	cmd := exec.CommandContext(ctx, bin, buildDaemonArgs(args, pidFile)...)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err != nil {
+		return 0, output.String(), fmt.Errorf("starting sshuttle: %w", err)
+	}
+	pid, err := waitForPIDFile(pidFile, 2*time.Second)
+	if err != nil {
+		return 0, output.String(), err
+	}
+	return pid, output.String(), nil
 }
 
 func waitForPIDFile(pidFile string, timeout time.Duration) (int, error) {
@@ -235,6 +291,134 @@ func FollowLogs() error {
 		}
 	}
 	return nil
+}
+
+// LogSession captures sshuttle logs without taking ownership of the terminal.
+type LogSession struct {
+	Lines  <-chan string
+	Done   <-chan error
+	Cancel func()
+}
+
+// StartLogStream starts the platform log commands and streams complete lines.
+func StartLogStream() (*LogSession, error) {
+	commands, err := logCommands(runtime.GOOS)
+	if err != nil {
+		return nil, err
+	}
+	lines := make(chan string)
+	done := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer close(lines)
+		var runErr error
+		for _, command := range commands {
+			cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				runErr = err
+				break
+			}
+			cmd.Stderr = cmd.Stdout
+			if err := cmd.Start(); err != nil {
+				runErr = err
+				break
+			}
+			scanner := bufio.NewScanner(stdout)
+			for scanner.Scan() {
+				select {
+				case lines <- scanner.Text():
+				case <-ctx.Done():
+					runErr = ctx.Err()
+				}
+				if runErr != nil {
+					break
+				}
+			}
+			if err := scanner.Err(); err != nil && runErr == nil {
+				runErr = err
+			}
+			waitErr := cmd.Wait()
+			if runErr == nil && waitErr != nil && ctx.Err() == nil {
+				runErr = waitErr
+			}
+			if runErr != nil || ctx.Err() != nil {
+				break
+			}
+		}
+		if errors.Is(runErr, context.Canceled) {
+			runErr = nil
+		}
+		done <- runErr
+		close(done)
+	}()
+	return &LogSession{Lines: lines, Done: done, Cancel: cancel}, nil
+}
+
+// StartCommandStream runs a foreground command without attaching it to the
+// terminal and streams combined output to the caller.
+func StartCommandStream(ctx context.Context, bin string, args []string, environment map[string]string) *LogSession {
+	lines := make(chan string)
+	done := make(chan error, 1)
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		defer close(lines)
+		cmd := exec.CommandContext(ctx, bin, args...)
+		if environment != nil {
+			cmd.Env = environmentWithOverrides(os.Environ(), environment)
+		}
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			done <- err
+			close(done)
+			return
+		}
+		cmd.Stderr = cmd.Stdout
+		if err := cmd.Start(); err != nil {
+			done <- err
+			close(done)
+			return
+		}
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			select {
+			case lines <- scanner.Text():
+			case <-ctx.Done():
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		err = scanner.Err()
+		waitErr := cmd.Wait()
+		if err == nil && waitErr != nil && ctx.Err() == nil {
+			err = waitErr
+		}
+		if errors.Is(err, context.Canceled) {
+			err = nil
+		}
+		done <- err
+		close(done)
+	}()
+	return &LogSession{Lines: lines, Done: done, Cancel: cancel}
+}
+
+func environmentWithOverrides(environment []string, overrides map[string]string) []string {
+	result := make([]string, 0, len(environment)+len(overrides))
+	for _, entry := range environment {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			result = append(result, entry)
+			continue
+		}
+		if _, overridden := overrides[key]; !overridden {
+			result = append(result, entry)
+		}
+	}
+	for key, value := range overrides {
+		result = append(result, key+"="+value)
+	}
+	return result
 }
 
 func logCommands(goos string) ([][]string, error) {

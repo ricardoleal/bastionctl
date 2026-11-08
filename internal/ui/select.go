@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strings"
 
@@ -23,6 +24,9 @@ type selectModel struct {
 	title    string
 	choices  []Choice
 	cursor   int
+	start    int // first visible item index (scroll anchor)
+	height   int // terminal height; 0 = unlimited (tests)
+	width    int
 	selected int
 	canceled bool
 }
@@ -34,51 +38,190 @@ var (
 	warningStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 )
 
+// listBudget keeps the legacy four-line reserve used by the scrollable
+// pickers (header, rule, rule, footer — see Chrome).
+func listBudget(height int) int {
+	return Chrome{}.Budget(height)
+}
+
+// lineWindow slices [start,end) item indexes that fit budget lines and
+// always contain cursor. start is the preferred upper anchor and is adjusted
+// minimally, so navigation scrolls the by-one and keeps long lists stable.
+func lineWindow(heights []int, cursor, start, budget int) (int, int) {
+	count := len(heights)
+	if count == 0 {
+		return 0, 0
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= count {
+		cursor = count - 1
+	}
+	if bucket := heights[cursor]; budget < bucket {
+		budget = bucket
+	}
+	if cursor < start {
+		start = cursor
+	}
+	if start > cursor {
+		start = cursor
+	}
+	if start < 0 {
+		start = 0
+	}
+	// Shrink from the top until start..cursor fits the budget.
+	used := 0
+	for index := start; index <= cursor; index++ {
+		used += heights[index]
+	}
+	for used > budget && start < cursor {
+		used -= heights[start]
+		start++
+	}
+	// Fill downward from the cursor...
+	end := cursor + 1
+	for end < count && used+heights[end] <= budget {
+		used += heights[end]
+		end++
+	}
+	// ...then fill upward above the retained top anchor.
+	for start > 0 && used+heights[start-1] <= budget {
+		start--
+		used += heights[start]
+	}
+	return start, end
+}
+
 func (m selectModel) Init() tea.Cmd { return nil }
 
+// selectItemHeights returns the rendered line count of each choice: one line
+// for the title, plus one when a description is shown under it.
+func selectItemHeights(choices []Choice) []int {
+	heights := make([]int, len(choices))
+	for index, choice := range choices {
+		if choice.Description == "" {
+			heights[index] = 1
+		} else {
+			heights[index] = 2
+		}
+	}
+	return heights
+}
+
 func (m selectModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
-	key, ok := message.(tea.KeyMsg)
-	if !ok {
+	switch message := message.(type) {
+	case tea.WindowSizeMsg:
+		m.height = message.Height
+		m.width = message.Width
 		return m, nil
-	}
-	switch key.String() {
-	case "up", "k":
-		if m.cursor > 0 {
-			m.cursor--
+	case tea.KeyMsg:
+		switch message.String() {
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		case "down", "j":
+			if m.cursor < len(m.choices)-1 {
+				m.cursor++
+			}
+		case "pgup":
+			m.cursor -= m.pageStep()
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+		case "pgdown":
+			m.cursor += m.pageStep()
+			if m.cursor > len(m.choices)-1 {
+				m.cursor = len(m.choices) - 1
+			}
+		case "enter":
+			m.selected = m.cursor
+			return m, tea.Quit
+		case "esc", "q", "ctrl+c":
+			m.canceled = true
+			return m, tea.Quit
+		default:
+			heights := selectItemHeights(m.choices)
+			m.start, _ = lineWindow(heights, m.cursor, m.start, listBudget(m.height))
+			return m, nil
 		}
-	case "down", "j":
-		if m.cursor < len(m.choices)-1 {
-			m.cursor++
-		}
-	case "enter":
-		m.selected = m.cursor
-		return m, tea.Quit
-	case "esc", "q", "ctrl+c":
-		m.canceled = true
-		return m, tea.Quit
 	}
+	heights := selectItemHeights(m.choices)
+	m.start, _ = lineWindow(heights, m.cursor, m.start, listBudget(m.height))
 	return m, nil
 }
 
+// pageStep is how far pgup/pgdn jump: the currently visible item count.
+func (m selectModel) pageStep() int {
+	budget := listBudget(m.height)
+	if budget == math.MaxInt {
+		return len(m.choices)
+	}
+	count := 0
+	used := 0
+	for _, height := range selectItemHeights(m.choices) {
+		if used+height > budget {
+			break
+		}
+		used += height
+		count++
+	}
+	if count < 1 {
+		count = 1
+	}
+	return count
+}
+
+func (m selectModel) chrome() Chrome {
+	return Chrome{
+		Title: m.title,
+		Info:  fmt.Sprintf("%d/%d", m.cursor+1, len(m.choices)),
+		Hints: []Hint{
+			{"↑/↓", "move"},
+			{"pgup/pgdn", "page"},
+			{"enter", "select"},
+			{"q", "cancel"},
+		},
+	}
+}
+
 func (m selectModel) View() string {
-	var output strings.Builder
-	output.WriteString(titleStyle.Render(m.title))
-	output.WriteString("\n\n")
-	for index, choice := range m.choices {
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	var b strings.Builder
+	heights := selectItemHeights(m.choices)
+	if len(heights) > 0 {
+		start, end := lineWindow(heights, m.cursor, m.start, m.chrome().Budget(m.height))
+		b.WriteString(renderChoices(m.choices, m.cursor, start, end))
+		b.WriteString("\n")
+	}
+	return m.chrome().View(b.String(), width, m.height)
+}
+
+// renderChoices draws the items in [start,end) with the cursor highlighted.
+// Line counts must stay consistent with selectItemHeights.
+func renderChoices(choices []Choice, cursor, start, end int) string {
+	var b strings.Builder
+	for index := start; index < end; index++ {
 		marker := "  "
-		title := choice.Title
-		if index == m.cursor {
+		title := choices[index].Title
+		if index == cursor {
 			marker = "> "
 			title = selectedStyle.Render(title)
 		}
-		fmt.Fprintf(&output, "%s%s", marker, title)
-		if choice.Description != "" {
-			fmt.Fprintf(&output, "\n    %s", descriptionStyle.Render(choice.Description))
+		fmt.Fprintf(&b, "%s%s\n", marker, title)
+		if choices[index].Description != "" {
+			fmt.Fprintf(&b, "    %s\n", descriptionStyle.Render(choices[index].Description))
 		}
-		output.WriteByte('\n')
 	}
-	output.WriteString("\n↑/↓ move  enter select  q cancel\n")
-	return output.String()
+	trimmed := b.String()
+	if strings.HasSuffix(trimmed, "\n") {
+		trimmed = strings.TrimSuffix(trimmed, "\n")
+	}
+	return trimmed
 }
 
 func Select(title string, choices []Choice) (int, bool, error) {
@@ -98,130 +241,12 @@ func Select(title string, choices []Choice) (int, bool, error) {
 	}
 
 	initial := selectModel{title: title, choices: choices, selected: -1}
-	result, err := tea.NewProgram(initial).Run()
+	result, err := tea.NewProgram(initial, tea.WithAltScreen()).Run()
 	if err != nil {
 		return 0, false, err
 	}
 	model := result.(selectModel)
 	return model.selected, model.canceled, nil
-}
-
-type ConnectionChoice struct {
-	Status   string
-	Name     string
-	Kind     string
-	Region   string
-	Networks string
-}
-
-func SelectConnection(choices []ConnectionChoice) (int, bool, error) {
-	if len(choices) == 0 {
-		return 0, true, nil
-	}
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
-		fmt.Println("Configured connections")
-		for index, choice := range choices {
-			fmt.Printf("  %d. %-15s %-24s %-10s %-16s %s\n", index+1, choice.Status, choice.Name, choice.Kind, choice.Region, choice.Networks)
-		}
-		return PromptSelect(len(choices), 1) - 1, false, nil
-	}
-
-	model := newConnectionModel(choices)
-	result, err := tea.NewProgram(model).Run()
-	if err != nil {
-		return 0, false, err
-	}
-	selected := result.(connectionModel)
-	return selected.selected, selected.canceled, nil
-}
-
-type connectionModel struct {
-	choices  []ConnectionChoice
-	table    table.Model
-	selected int
-	canceled bool
-}
-
-func newConnectionModel(choices []ConnectionChoice) connectionModel {
-	tableModel := table.New(
-		table.WithColumns(connectionColumns(120)),
-		table.WithRows(connectionRows(choices, 120)),
-		table.WithFocused(true),
-		table.WithHeight(10),
-		table.WithStyles(sharedTableStyles()),
-	)
-	return connectionModel{choices: choices, table: tableModel, selected: -1}
-}
-
-func (m connectionModel) Init() tea.Cmd { return nil }
-
-func (m connectionModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
-	switch message := message.(type) {
-	case tea.WindowSizeMsg:
-		m.table.SetWidth(max(message.Width, 40))
-		m.table.SetHeight(max(message.Height-7, 4))
-		safeSetColumnsRows(&m.table, connectionColumns(message.Width), connectionRows(m.choices, message.Width))
-		return m, nil
-	case tea.KeyMsg:
-		switch message.String() {
-		case "enter":
-			m.selected = m.table.Cursor()
-			return m, tea.Quit
-		case "esc", "q", "ctrl+c":
-			m.canceled = true
-			return m, tea.Quit
-		}
-	}
-	var command tea.Cmd
-	m.table, command = m.table.Update(message)
-	return m, command
-}
-
-func (m connectionModel) View() string {
-	header := fmt.Sprintf("%s  %s", titleStyle.Render("Configured connections"), descriptionStyle.Render(fmt.Sprintf("%d entries", len(m.choices))))
-	position := descriptionStyle.Render(fmt.Sprintf("%d/%d", m.table.Cursor()+1, len(m.choices)))
-	return header + "\n\n" + m.table.View() + "\n" + position + "  ↑/↓ move  pgup/pgdn jump  enter select  q cancel\n"
-}
-
-func connectionColumns(width int) []table.Column {
-	switch {
-	case width >= 110:
-		return []table.Column{
-			{Title: "Status", Width: 15},
-			{Title: "Connection", Width: 28},
-			{Title: "Kind", Width: 10},
-			{Title: "Region", Width: 16},
-			{Title: "Networks", Width: max(width-77, 20)},
-		}
-	case width >= 80:
-		return []table.Column{
-			{Title: "Status", Width: 15},
-			{Title: "Connection", Width: 24},
-			{Title: "Region", Width: 16},
-			{Title: "Networks", Width: max(width-63, 14)},
-		}
-	default:
-		return []table.Column{
-			{Title: "Status", Width: 15},
-			{Title: "Connection", Width: max(width-37, 14)},
-			{Title: "Region", Width: 16},
-		}
-	}
-}
-
-func connectionRows(choices []ConnectionChoice, width int) []table.Row {
-	rows := make([]table.Row, len(choices))
-	for index, choice := range choices {
-		switch {
-		case width >= 110:
-			rows[index] = table.Row{choice.Status, choice.Name, choice.Kind, choice.Region, choice.Networks}
-		case width >= 80:
-			rows[index] = table.Row{choice.Status, choice.Name, choice.Region, choice.Networks}
-		default:
-			rows[index] = table.Row{choice.Status, choice.Name, choice.Region}
-		}
-	}
-	return rows
 }
 
 func sharedTableStyles() table.Styles {
@@ -248,9 +273,17 @@ func safeSetColumnsRows(t *table.Model, cols []table.Column, rows []table.Row) {
 	t.SetColumns(cols)
 }
 
-func SelectCandidate(candidates []probe.Candidate) (int, bool, error) {
+func SelectCandidate(candidates []probe.Candidate, currentInstanceID ...string) (int, bool, error) {
 	if len(candidates) == 0 {
 		return 0, true, nil
+	}
+	currentID := ""
+	if len(currentInstanceID) > 0 {
+		currentID = currentInstanceID[0]
+	}
+	candidates = append([]probe.Candidate(nil), candidates...)
+	for index := range candidates {
+		candidates[index].Current = candidates[index].InstanceID == currentID && currentID != ""
 	}
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
 		choices := make([]Choice, len(candidates))
@@ -260,11 +293,16 @@ func SelectCandidate(candidates []probe.Candidate) (int, bool, error) {
 				Description: candidateDescription(candidate),
 			}
 		}
-		return Select("Select a pivot instance", choices)
+		title := "Select a pivot instance"
+		if currentID != "" {
+			title = "Select a new pivot instance (current: " + currentID + ")"
+		}
+		return Select(title, choices)
 	}
 
 	model := newCandidateModel(candidates)
-	result, err := tea.NewProgram(model).Run()
+	model.currentInstanceID = currentID
+	result, err := tea.NewProgram(model, tea.WithAltScreen()).Run()
 	if err != nil {
 		return 0, false, err
 	}
@@ -273,11 +311,12 @@ func SelectCandidate(candidates []probe.Candidate) (int, bool, error) {
 }
 
 type candidateModel struct {
-	candidates []probe.Candidate
-	table      table.Model
-	width      int
-	selected   int
-	canceled   bool
+	candidates        []probe.Candidate
+	table             table.Model
+	width             int
+	selected          int
+	canceled          bool
+	currentInstanceID string
 }
 
 func newCandidateModel(candidates []probe.Candidate) candidateModel {
@@ -298,7 +337,7 @@ func (m candidateModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = message.Width
 		m.table.SetWidth(max(message.Width, 40))
-		m.table.SetHeight(max(message.Height-7, 4))
+		m.table.SetHeight(max(Chrome{}.Budget(message.Height), 3))
 		safeSetColumnsRows(&m.table, candidateColumns(message.Width), candidateRows(m.candidates, message.Width))
 		return m, nil
 	case tea.KeyMsg:
@@ -317,9 +356,25 @@ func (m candidateModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m candidateModel) View() string {
-	header := fmt.Sprintf("%s  %s", titleStyle.Render("Select a pivot instance"), descriptionStyle.Render(fmt.Sprintf("%d candidates", len(m.candidates))))
-	position := descriptionStyle.Render(fmt.Sprintf("%d/%d", m.table.Cursor()+1, len(m.candidates)))
-	return header + "\n\n" + m.table.View() + "\n" + position + "  ↑/↓ move  pgup/pgdn jump  enter select  q cancel\n"
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	chrome := Chrome{
+		Title: "Select a pivot instance",
+		Info:  fmt.Sprintf("%d/%d · %d candidates", m.table.Cursor()+1, len(m.candidates), len(m.candidates)),
+		Hints: []Hint{
+			{"↑/↓", "move"},
+			{"pgup/pgdn", "jump"},
+			{"enter", "select"},
+			{"q", "cancel"},
+		},
+	}
+	if m.currentInstanceID != "" {
+		chrome.Title = "Select a new pivot instance"
+		chrome.Info += " · current: " + m.currentInstanceID
+	}
+	return chrome.View(m.table.View(), width, 0) // table height already capped in Update
 }
 
 func candidateColumns(width int) []table.Column {
@@ -364,6 +419,9 @@ func candidateRows(candidates []probe.Candidate, width int) []table.Row {
 		if name == "" {
 			name = "unnamed"
 		}
+		if candidate.Current {
+			name += " [current]"
+		}
 		status := candidateStatus(candidate)
 		egress := "-"
 		if candidate.Reachable {
@@ -405,6 +463,9 @@ func candidateTitle(candidate probe.Candidate) string {
 	if name == "" {
 		name = "unnamed"
 	}
+	if candidate.Current {
+		name += " [current]"
+	}
 	return fmt.Sprintf("%s  %s", name, candidate.InstanceID)
 }
 
@@ -415,67 +476,158 @@ func candidateDescription(candidate probe.Candidate) string {
 type routeModel struct {
 	routes   []config.NetworkRoute
 	cursor   int
+	start    int // first visible route index (scroll anchor)
+	height   int // terminal height; 0 = unlimited (tests)
+	width    int
 	done     bool
 	canceled bool
 }
 
+// routeItemLines is how many lines each route card renders: the CIDR line
+// plus one metadata line below it.
+const routeItemLines = 2
+
 func (m routeModel) Init() tea.Cmd { return nil }
 
+func routeItemHeights(routeCount int) []int {
+	heights := make([]int, routeCount)
+	for index := range heights {
+		heights[index] = routeItemLines
+	}
+	return heights
+}
+
 func (m routeModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
-	key, ok := message.(tea.KeyMsg)
-	if !ok {
+	switch message := message.(type) {
+	case tea.WindowSizeMsg:
+		m.height = message.Height
+		m.width = message.Width
 		return m, nil
-	}
-	switch key.String() {
-	case "up", "k":
-		if m.cursor > 0 {
-			m.cursor--
+	case tea.KeyMsg:
+		switch message.String() {
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		case "down", "j":
+			if m.cursor < len(m.routes)-1 {
+				m.cursor++
+			}
+		case "pgup":
+			m.cursor -= m.pageStep()
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+		case "pgdown":
+			m.cursor += m.pageStep()
+			if m.cursor > len(m.routes)-1 {
+				m.cursor = len(m.routes) - 1
+			}
+		case " ":
+			m.routes[m.cursor].Selected = !m.routes[m.cursor].Selected
+		case "a", "A":
+			allSelected := true
+			for _, route := range m.routes {
+				if !route.Selected {
+					allSelected = false
+					break
+				}
+			}
+			for index := range m.routes {
+				m.routes[index].Selected = !allSelected
+			}
+		case "enter":
+			m.done = true
+			return m, tea.Quit
+		case "esc", "q", "ctrl+c":
+			m.canceled = true
+			return m, tea.Quit
+		default:
+			heights := routeItemHeights(len(m.routes))
+			m.start, _ = lineWindow(heights, m.cursor, m.start, listBudget(m.height))
+			return m, nil
 		}
-	case "down", "j":
-		if m.cursor < len(m.routes)-1 {
-			m.cursor++
-		}
-	case " ":
-		m.routes[m.cursor].Selected = !m.routes[m.cursor].Selected
-	case "enter":
-		m.done = true
-		return m, tea.Quit
-	case "esc", "q", "ctrl+c":
-		m.canceled = true
-		return m, tea.Quit
 	}
+	heights := routeItemHeights(len(m.routes))
+	m.start, _ = lineWindow(heights, m.cursor, m.start, listBudget(m.height))
 	return m, nil
 }
 
-func (m routeModel) View() string {
-	var output strings.Builder
-	output.WriteString(titleStyle.Render("Select networks to tunnel"))
-	output.WriteString("\n\n")
-	for index, route := range m.routes {
-		cursor := "  "
-		if index == m.cursor {
-			cursor = "> "
-		}
-		checked := "[ ]"
+// pageStep is how far pgup/pgdn jump: the currently visible route count.
+func (m routeModel) pageStep() int {
+	budget := listBudget(m.height)
+	if budget == math.MaxInt {
+		return len(m.routes)
+	}
+	return max(budget/routeItemLines, 1)
+}
+
+func (m routeModel) chrome() Chrome {
+	return Chrome{
+		Title: "Select networks to tunnel",
+		Info:  fmt.Sprintf("%d/%d · %d selected", m.cursor+1, len(m.routes), countSelectedRoutes(m.routes)),
+		Hints: []Hint{
+			{"↑/↓", "move"},
+			{"pgup/pgdn", "page"},
+			{"space", "toggle"},
+			{"a", "all"},
+			{"enter", "save"},
+			{"q", "cancel"},
+		},
+	}
+}
+
+func countSelectedRoutes(routes []config.NetworkRoute) int {
+	count := 0
+	for _, route := range routes {
 		if route.Selected {
+			count++
+		}
+	}
+	return count
+}
+
+func (m routeModel) View() string {
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	var b strings.Builder
+	heights := routeItemHeights(len(m.routes))
+	if len(heights) > 0 {
+		start, end := lineWindow(heights, m.cursor, m.start, m.chrome().Budget(m.height))
+		b.WriteString(renderRoutes(m.routes, m.cursor, start, end))
+		b.WriteString("\n")
+	}
+	return m.chrome().View(b.String(), width, m.height)
+}
+
+// renderRoutes draws the routes in [start,end). Line counts must stay
+// consistent with routeItemHeights (cidr line + one metadata line).
+func renderRoutes(routes []config.NetworkRoute, cursor, start, end int) string {
+	var b strings.Builder
+	for index := start; index < end; index++ {
+		checked := "[ ]"
+		if routes[index].Selected {
 			checked = "[x]"
 		}
-		line := fmt.Sprintf("%s%s %s", cursor, checked, route.CIDR)
-		if index == m.cursor {
+		line := fmt.Sprintf("  %s %s", checked, routes[index].CIDR)
+		if index == cursor {
+			line = "> " + strings.TrimPrefix(line, "  ")
 			line = selectedStyle.Render(line)
 		}
-		output.WriteString(line)
-		metadata := route.Source
-		if route.TargetID != "" {
-			metadata += " · " + route.TargetType + " " + route.TargetID
+		b.WriteString(line)
+		metadata := routes[index].Source
+		if routes[index].TargetID != "" {
+			metadata += " · " + routes[index].TargetType + " " + routes[index].TargetID
 		}
-		if route.Description != "" {
-			metadata += " · " + route.Description
+		if routes[index].Description != "" {
+			metadata += " · " + routes[index].Description
 		}
-		fmt.Fprintf(&output, "\n      %s\n", descriptionStyle.Render(metadata))
+		fmt.Fprintf(&b, "\n      %s\n", descriptionStyle.Render(metadata))
 	}
-	output.WriteString("\n↑/↓ move  space toggle  enter save  q cancel\n")
-	return output.String()
+	trimmed := b.String()
+	return strings.TrimSuffix(trimmed, "\n")
 }
 
 func SelectRoutes(routes []config.NetworkRoute) ([]config.NetworkRoute, bool, error) {
@@ -485,7 +637,7 @@ func SelectRoutes(routes []config.NetworkRoute) ([]config.NetworkRoute, bool, er
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
 		return routes, false, nil
 	}
-	result, err := tea.NewProgram(routeModel{routes: append([]config.NetworkRoute(nil), routes...)}).Run()
+	result, err := tea.NewProgram(routeModel{routes: append([]config.NetworkRoute(nil), routes...)}, tea.WithAltScreen()).Run()
 	if err != nil {
 		return nil, false, err
 	}
@@ -495,4 +647,20 @@ func SelectRoutes(routes []config.NetworkRoute) ([]config.NetworkRoute, bool, er
 
 func Warning(message string) string {
 	return warningStyle.Render(message)
+}
+
+// Interactive reports whether both stdin and stdout are terminals.
+func Interactive() bool {
+	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+// Pause waits for the user to press Enter so printed output can be read
+// before the caller redraws (e.g. before the manage menu reopens). It is a
+// no-op when stdin/stdout are not interactive.
+func Pause(message string) {
+	if !Interactive() {
+		return
+	}
+	fmt.Printf("%s", message)
+	_, _ = stdin.ReadString('\n')
 }

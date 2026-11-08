@@ -37,6 +37,7 @@ type Candidate struct {
 	Method    string // MethodSSM or MethodDirectIP, empty if unreachable
 	Reachable bool
 	Banner    string // only meaningful for MethodDirectIP
+	Current   bool   // already selected by the connection being rescanned
 
 	// VpcEgressOK reports whether this instance's own Security Group
 	// egress rules allow it to reach every one of its VPC's CIDR blocks --

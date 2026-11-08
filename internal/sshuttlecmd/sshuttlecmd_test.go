@@ -1,6 +1,7 @@
 package sshuttlecmd
 
 import (
+	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -53,6 +54,44 @@ func TestBuildDaemonArgs(t *testing.T) {
 	}
 }
 
+func TestStartBackgroundCapturedReturnsChildOutput(t *testing.T) {
+	directory := t.TempDir()
+	pidFile := filepath.Join(directory, "sshuttle.pid")
+	script := filepath.Join(directory, "fake-sshuttle")
+	contents := "#!/bin/sh\n" +
+		"printf 'captured stdout\\n'\n" +
+		"printf 'captured stderr\\n' >&2\n" +
+		"while [ $# -gt 0 ]; do\n" +
+		"  if [ \"$1\" = '--pidfile' ]; then shift; printf '12345\\n' > \"$1\"; break; fi\n" +
+		"  shift\n" +
+		"done\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pid, output, err := StartBackgroundCaptured(context.Background(), script, []string{"-r", "i-1"}, pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid != 12345 || !strings.Contains(output, "captured stdout") || !strings.Contains(output, "captured stderr") {
+		t.Fatalf("pid=%d output=%q", pid, output)
+	}
+}
+
+func TestStartCommandStreamCapturesCombinedOutput(t *testing.T) {
+	session := StartCommandStream(context.Background(), "/bin/sh", []string{"-c", "printf 'launch output\\n'; printf 'launch error\\n' >&2"}, nil)
+	var output []string
+	for line := range session.Lines {
+		output = append(output, line)
+	}
+	if err := <-session.Done; err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(output, "\n")
+	if !strings.Contains(joined, "launch output") || !strings.Contains(joined, "launch error") {
+		t.Fatalf("captured output = %q", joined)
+	}
+}
+
 func TestLogCommands(t *testing.T) {
 	commands, err := logCommands("darwin")
 	if err != nil {
@@ -96,6 +135,78 @@ func TestBuildArgsUsesSelectedRoutes(t *testing.T) {
 		},
 	}
 	want := []string{"-r", "i-0123456789abcdef0", "10.20.0.0/16"}
+	if got := BuildArgs(cfg); !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildArgs() = %q, want %q", got, want)
+	}
+}
+
+func TestDNSArgsByMode(t *testing.T) {
+	if got := DNSArgs(nil); got != nil {
+		t.Fatalf("DNSArgs(nil) = %q", got)
+	}
+	if got := DNSArgs(&config.DNSConfig{}); got != nil {
+		t.Fatalf("DNSArgs(off) = %q", got)
+	}
+	if got := DNSArgs(&config.DNSConfig{Mode: config.DNSModeAll}); !reflect.DeepEqual(got, []string{"--dns"}) {
+		t.Fatalf("DNSArgs(all) = %q", got)
+	}
+	if got := DNSArgs(&config.DNSConfig{Mode: config.DNSModeAll, ToNS: "10.6.6.6:5353"}); !reflect.DeepEqual(got, []string{"--dns", "--to-ns", "10.6.6.6:5353"}) {
+		t.Fatalf("DNSArgs(all+to-ns) = %q", got)
+	}
+	split := &config.DNSConfig{
+		Mode:     config.DNSModeSplit,
+		Resolver: []string{"10.0.0.2", "10.1.0.2"},
+	}
+	if got := DNSArgs(split); !reflect.DeepEqual(got, []string{"--ns-hosts", "10.0.0.2,10.1.0.2"}) {
+		t.Fatalf("DNSArgs(split) = %q", got)
+	}
+	split.ToNS = "10.1.0.2"
+	if got := DNSArgs(split); !reflect.DeepEqual(got, []string{"--ns-hosts", "10.0.0.2,10.1.0.2", "--to-ns", "10.1.0.2"}) {
+		t.Fatalf("DNSArgs(split+to-ns) = %q", got)
+	}
+}
+
+func TestBuildArgsFullDNSDefaultsToVPCResolver(t *testing.T) {
+	cfg := &config.Config{
+		Target: "i-0123456789abcdef0", VpcCIDRs: []string{"172.31.0.0/16"},
+		Routes: []config.NetworkRoute{{CIDR: "172.31.0.0/16", Selected: true}},
+		DNS:    &config.DNSConfig{Mode: config.DNSModeAll},
+	}
+	want := []string{"-r", "i-0123456789abcdef0", "172.31.0.0/16", "--dns", "--to-ns", "172.31.0.2"}
+	if got := BuildArgs(cfg); !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildArgs(all DNS) = %q, want %q", got, want)
+	}
+	cfg.DNS.Resolver = []string{"10.20.0.53"}
+	want[len(want)-1] = "10.20.0.53"
+	if got := BuildArgs(cfg); !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildArgs(all DNS with resolver field) = %q, want %q", got, want)
+	}
+	cfg.DNS.ToNS = "1.1.1.1"
+	want[len(want)-1] = "1.1.1.1"
+	if got := BuildArgs(cfg); !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildArgs(all DNS with explicit forwarder) = %q, want %q", got, want)
+	}
+}
+
+func TestBuildArgsAppendsDNSFlagsAfterSubnets(t *testing.T) {
+	cfg := &config.Config{
+		Target:     "i-0123456789abcdef0",
+		VpcCIDRs:   []string{"10.0.0.0/16"},
+		SSHKeyPath: "",
+		SSHPort:    22,
+		DNS: &config.DNSConfig{
+			Mode:     config.DNSModeSplit,
+			Resolver: []string{"10.0.0.2"},
+			Domains:  []string{"corp.internal"},
+			ToNS:     "10.0.0.2",
+		},
+	}
+	want := []string{
+		"-r", "i-0123456789abcdef0",
+		"10.0.0.0/16",
+		"--ns-hosts", "10.0.0.2",
+		"--to-ns", "10.0.0.2",
+	}
 	if got := BuildArgs(cfg); !reflect.DeepEqual(got, want) {
 		t.Fatalf("BuildArgs() = %q, want %q", got, want)
 	}
