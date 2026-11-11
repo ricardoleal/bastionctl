@@ -359,13 +359,16 @@ func TestRegisteredActionShowsProgressAndResultModal(t *testing.T) {
 	}
 	updated, followup := model.Update(command())
 	model = updated.(appModel)
-	if followup != nil || model.actionModal == nil || model.actionModal.running || !strings.Contains(model.View(), "corp is running") {
+	if model.actionModal == nil || model.actionModal.running || !strings.Contains(model.View(), "corp is running") {
 		t.Fatalf("result modal missing: modal = %+v", model.actionModal)
 	}
-	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if followup == nil {
+		t.Fatal("completed action did not schedule auto-dismiss")
+	}
+	updated, _ = model.Update(modalDismissTickMsg{id: model.actionModal.id})
 	model = updated.(appModel)
 	if model.actionModal != nil || model.outcome.Action != "" {
-		t.Fatalf("modal dismissal changed app state: modal = %+v, outcome = %+v", model.actionModal, model.outcome)
+		t.Fatalf("auto-dismiss changed app state: modal = %+v, outcome = %+v", model.actionModal, model.outcome)
 	}
 }
 
@@ -460,6 +463,60 @@ func TestActionRefreshUpdatesHomeAfterModalDismissal(t *testing.T) {
 	model = updated.(appModel)
 	if model.options.Summaries[0].Running || !model.options.Summaries[0].Reachable {
 		t.Fatalf("late refresh was discarded: %+v", model.options.Summaries[0])
+	}
+}
+
+func TestActionModalAutoDismissesAfterSuccess(t *testing.T) {
+	model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{
+		Actions: map[string]ActionHandler{
+			ActStart: func(string) (ActionResult, error) {
+				return ActionResult{Title: "Tunnel started", Body: "corp is running."}, nil
+			},
+		},
+	})
+	updated, actionCommand := model.requestAction(ActStart, "corp", ViewHome)
+	model = updated.(appModel)
+	updated, _ = model.Update(actionCommand())
+	model = updated.(appModel)
+	if model.actionModal == nil || model.actionModal.running || model.actionModal.failed {
+		t.Fatalf("action did not complete into a result modal: %+v", model.actionModal)
+	}
+	updated, _ = model.Update(modalDismissTickMsg{id: model.actionModal.id})
+	model = updated.(appModel)
+	if model.actionModal != nil {
+		t.Fatal("completed action modal was not auto-dismissed")
+	}
+}
+
+func TestActionModalAutoDismissIgnoresStaleTickAndFailures(t *testing.T) {
+	model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{
+		Actions: map[string]ActionHandler{
+			ActStart: func(string) (ActionResult, error) { return ActionResult{}, errors.New("boom") },
+		},
+	})
+	updated, actionCommand := model.requestAction(ActStart, "corp", ViewHome)
+	model = updated.(appModel)
+	updated, _ = model.Update(actionCommand())
+	model = updated.(appModel)
+	if model.actionModal == nil || !model.actionModal.failed {
+		t.Fatal("failure was not shown in the modal")
+	}
+	// Failures wait for explicit dismissal: the timer must not clear them.
+	updated, _ = model.Update(modalDismissTickMsg{id: model.actionModal.id})
+	model = updated.(appModel)
+	if model.actionModal == nil {
+		t.Fatal("failed action modal was auto-dismissed")
+	}
+	// A stale tick (different id, e.g. from a previous action) is ignored.
+	updated, _ = model.Update(modalDismissTickMsg{id: model.actionModal.id + 999})
+	model = updated.(appModel)
+	if model.actionModal == nil {
+		t.Fatal("stale tick dismissed an unrelated modal")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(appModel)
+	if model.actionModal != nil {
+		t.Fatal("failed action modal should still be dismissible by key")
 	}
 }
 

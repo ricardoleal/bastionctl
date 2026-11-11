@@ -327,6 +327,30 @@ type actionFinishedMsg struct {
 	targetReachable   bool
 }
 
+type modalDismissTickMsg struct{ id int }
+
+// actionModalAutoDismiss is how long a completed action message box
+// stays on screen before clearing itself. Failed actions keep waiting
+// for explicit dismissal so the error is not lost.
+const actionModalAutoDismiss = 4 * time.Second
+
+func dismissModalAfter(id int) tea.Cmd {
+	return tea.Tick(actionModalAutoDismiss, func(time.Time) tea.Msg {
+		return modalDismissTickMsg{id: id}
+	})
+}
+
+// scheduleModalDismiss arranges self-clearing for a completed action
+// message box that is still on screen. It is called at every point
+// where follow-up work (table refresh, detail load) has finished, so
+// the timer only starts once the modal is in its final state.
+func (m appModel) scheduleModalDismiss() tea.Cmd {
+	if m.actionModal == nil || m.actionModal.running || m.actionModal.failed || m.actionModal.confirmAction != "" {
+		return nil
+	}
+	return dismissModalAfter(m.actionModal.id)
+}
+
 type logLineMsg string
 type logDoneMsg struct{ err error }
 type configLoadedMsg struct {
@@ -578,6 +602,15 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.logDone = true
 		m.logError = message.err
 		return m, nil
+	case modalDismissTickMsg:
+		// Only clear the box if it is still this exact result: a newer
+		// action has a different id, and failures/confirmations must
+		// always wait for the user.
+		if m.actionModal != nil && m.actionModal.id == message.id &&
+			!m.actionModal.running && !m.actionModal.failed && m.actionModal.confirmAction == "" {
+			m.actionModal = nil
+		}
+		return m, nil
 	case actionFinishedMsg:
 		if m.actionModal == nil || message.id != m.actionModal.id {
 			return m, nil
@@ -623,7 +656,7 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 					return detailLoadedMsg{name: name, detail: detail, err: err}
 				}
 			}
-			return m, nil
+			return m, m.scheduleModalDismiss()
 		}
 		if message.result.RemoveConnection {
 			filtered := m.options.Summaries[:0]
@@ -636,7 +669,7 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.options.Level = 0
 			m.options.Detail = nil
 			m.refreshHomeTable(false)
-			return m, nil
+			return m, m.scheduleModalDismiss()
 		}
 		if message.result.Refresh && m.options.RefreshConnection != nil {
 			refresh, name, id := m.options.RefreshConnection, message.connection, message.id
@@ -666,7 +699,7 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		return m, nil
+		return m, m.scheduleModalDismiss()
 	case connectionRefreshedMsg:
 		if message.err != nil {
 			if m.actionModal != nil && message.id == m.actionModal.id {
@@ -687,7 +720,7 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.options.Level == 1 && m.options.Detail != nil && m.options.Detail.Name == message.name {
 			m.options.Detail = message.detail
 		}
-		return m, nil
+		return m, m.scheduleModalDismiss()
 	case detailLoadedMsg:
 		if message.name != m.loadingDetail {
 			return m, nil
@@ -706,7 +739,7 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.outcome.Action = ""
 		m.outcome.Connection = message.name
 		m.outcome.View = ViewConnection
-		return m, nil
+		return m, m.scheduleModalDismiss()
 	case tea.WindowSizeMsg:
 		m.width = message.Width
 		m.height = message.Height
