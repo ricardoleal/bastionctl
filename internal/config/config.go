@@ -437,6 +437,11 @@ func (s *Store) List(accountID string) ([]*Config, error) {
 			continue
 		}
 		name := strings.TrimSuffix(entry.Name(), ".yaml")
+		if strings.HasSuffix(name, ".dns-state") {
+			// Sidecar holding split-DNS resolver state for a sibling
+			// connection (<name>.dns-state.yaml); not a connection.
+			continue
+		}
 		profile, err := s.Load(accountID, name)
 		if err != nil {
 			return nil, err

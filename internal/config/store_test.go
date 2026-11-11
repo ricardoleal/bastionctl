@@ -4,8 +4,33 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
+
+func TestStoreListSkipsDnsStateSidecars(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.Save("111111111111", "analytics.de.split", &Config{Target: "i-123"}); err != nil {
+		t.Fatal(err)
+	}
+	// Sidecar written for split-DNS resolver state next to a real connection.
+	path, err := store.ProfilePath("111111111111", "analytics.de.split")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecar := strings.TrimSuffix(path, ".yaml") + ".dns-state.yaml"
+	if err := os.WriteFile(sidecar, []byte("resolver: 10.0.0.2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	profiles, err := store.List("111111111111")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 1 || profiles[0].Name != "analytics.de.split" {
+		t.Fatalf("profiles = %#v, want only analytics.de.split", profiles)
+	}
+}
 
 func TestStoreSeparatesAccountsAndRoundTripsRoutes(t *testing.T) {
 	store := NewStore(t.TempDir())
