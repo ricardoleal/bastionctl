@@ -68,12 +68,50 @@ func TestStartBackgroundCapturedReturnsChildOutput(t *testing.T) {
 	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	pid, output, err := StartBackgroundCaptured(context.Background(), script, []string{"-r", "i-1"}, pidFile)
+	pid, output, err := StartBackgroundCaptured(context.Background(), script, []string{"-r", "i-1"}, pidFile, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if pid != 12345 || !strings.Contains(output, "captured stdout") || !strings.Contains(output, "captured stderr") {
 		t.Fatalf("pid=%d output=%q", pid, output)
+	}
+}
+
+func TestStartBackgroundCapturedAppliesEnvironmentOverrides(t *testing.T) {
+	directory := t.TempDir()
+	pidFile := filepath.Join(directory, "sshuttle.pid")
+	envFile := filepath.Join(directory, "env.txt")
+	script := filepath.Join(directory, "fake-sshuttle")
+	contents := "#!/bin/sh\n" +
+		"env | grep '^AWS_' > \"" + envFile + "\"\n" +
+		"while [ $# -gt 0 ]; do\n" +
+		"  if [ \"$1\" = '--pidfile' ]; then shift; printf '12345\\n' > \"$1\"; break; fi\n" +
+		"  shift\n" +
+		"done\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_REGION", "eu-central-1")
+	t.Setenv("AWS_DEFAULT_REGION", "eu-central-1")
+	overrides := map[string]string{
+		"AWS_REGION":         "us-east-1",
+		"AWS_DEFAULT_REGION": "us-east-1",
+		"AWS_PROFILE":        "analytics",
+	}
+	if _, _, err := StartBackgroundCaptured(context.Background(), script, []string{"-r", "i-1"}, pidFile, overrides); err != nil {
+		t.Fatal(err)
+	}
+	environment, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"AWS_REGION=us-east-1", "AWS_DEFAULT_REGION=us-east-1", "AWS_PROFILE=analytics"} {
+		if !strings.Contains(string(environment), want+"\n") {
+			t.Fatalf("child environment missing %s: got %q", want, string(environment))
+		}
+	}
+	if strings.Contains(string(environment), "eu-central-1") {
+		t.Fatalf("parent region leaked into child environment: %q", string(environment))
 	}
 }
 

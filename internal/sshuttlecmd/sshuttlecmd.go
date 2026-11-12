@@ -135,8 +135,13 @@ func StartBackground(bin string, args []string, pidFile string) (int, error) {
 
 // StartBackgroundCaptured starts sshuttle without inheriting the interactive
 // terminal and returns any startup output for an in-app caller to display.
-func StartBackgroundCaptured(ctx context.Context, bin string, args []string, pidFile string) (int, string, error) {
+// environment entries override the parent process's variables for the child
+// (e.g. AWS_REGION, so the SSM ProxyCommand targets the connection's region).
+func StartBackgroundCaptured(ctx context.Context, bin string, args []string, pidFile string, environment map[string]string) (int, string, error) {
 	cmd := exec.CommandContext(ctx, bin, buildDaemonArgs(args, pidFile)...)
+	if environment != nil {
+		cmd.Env = environmentWithOverrides(os.Environ(), environment)
+	}
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output

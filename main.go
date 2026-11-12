@@ -1611,13 +1611,20 @@ func browserStartResult(env *browserEnv, bin, name string) (ui.ActionResult, err
 	}
 	ctx, cancel := context.WithTimeout(env.ctx, 90*time.Second)
 	defer cancel()
+	// The child sshuttle spawns `aws ssm start-session` via the user's SSH
+	// ProxyCommand; it must call the API in the connection's region, not in
+	// the profile's default region (a US instance queried in eu-central-1
+	// fails with TargetNotConnected even while its SSM agent is online).
+	environment := map[string]string{
+		"AWS_REGION":         cfg.Region,
+		"AWS_DEFAULT_REGION": cfg.Region,
+	}
+	if profile := effectiveAWSProfile(cfg, env.awsProfile); profile != "" {
+		environment["AWS_PROFILE"] = profile
+	}
 	var pid int
 	var output string
-	startErr := withAWSProfileErr(effectiveAWSProfile(cfg, env.awsProfile), func() error {
-		var runErr error
-		pid, output, runErr = sshuttlecmd.StartBackgroundCaptured(ctx, bin, sshuttlecmd.BuildArgs(cfg), pidFile)
-		return runErr
-	})
+	pid, output, startErr := sshuttlecmd.StartBackgroundCaptured(ctx, bin, sshuttlecmd.BuildArgs(cfg), pidFile, environment)
 	if startErr != nil {
 		if installed != nil {
 			options := dnsresolver.DefaultOptions()
