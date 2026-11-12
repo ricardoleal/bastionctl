@@ -213,6 +213,12 @@ func (o *Options) runSudo(name string, args ...string) ([]byte, error) {
 	return o.run("sudo", append([]string{name}, args...)...)
 }
 
+// ErrSudoUnavailable is returned when system resolver changes need root
+// privileges but sudo cannot ask for a password: no cached timestamp and
+// no interactive terminal (the browser TUI owns the terminal, so it sets
+// TerminalIn=false to keep sudo from wedging on a hidden prompt).
+var ErrSudoUnavailable = errors.New("split-DNS resolver management needs root access")
+
 func (o *Options) ensureSudoUsable() error {
 	if _, err := o.Run("sudo", "-n", "true"); err == nil {
 		return nil
@@ -220,7 +226,7 @@ func (o *Options) ensureSudoUsable() error {
 	if o.TerminalIn {
 		return nil // sudo can prompt for a password; let it.
 	}
-	return errors.New("split-DNS resolver management needs root access; run bastionctl in an interactive terminal so sudo can prompt for a password, or run it as root")
+	return fmt.Errorf("%w: sudo has no cached timestamp and there is no terminal to prompt in — run `sudo -v` in the terminal running bastionctl, then start the connection again", ErrSudoUnavailable)
 }
 
 // sudoHint prefixes printed instructions with "sudo " when applicable.

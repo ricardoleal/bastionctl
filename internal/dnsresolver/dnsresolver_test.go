@@ -314,8 +314,11 @@ func TestDarwinInstallFailsFastWithoutTerminalAndSudo(t *testing.T) {
 		return []byte("sudo: a password is required\n"), errors.New("exit status 1")
 	}
 	_, err := o.Install(testConfig("corp"), filepath.Join(t.TempDir(), "state.yaml"))
-	if err == nil || !strings.Contains(err.Error(), "interactive terminal") {
-		t.Fatalf("error = %v, want sudo fail-fast message", err)
+	if err == nil || !strings.Contains(err.Error(), "sudo -v") {
+		t.Fatalf("error = %v, want sudo fail-fast message with a sudo -v hint", err)
+	}
+	if !errors.Is(err, ErrSudoUnavailable) {
+		t.Fatalf("error = %v, want it to wrap ErrSudoUnavailable", err)
 	}
 }
 
