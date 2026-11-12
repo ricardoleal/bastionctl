@@ -2,6 +2,7 @@ package ui
 
 import (
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -517,6 +518,131 @@ func TestActionModalAutoDismissIgnoresStaleTickAndFailures(t *testing.T) {
 	model = updated.(appModel)
 	if model.actionModal != nil {
 		t.Fatal("failed action modal should still be dismissible by key")
+	}
+}
+
+func TestStartAsksForSudoWhenTimestampMissing(t *testing.T) {
+	var started bool
+	model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{
+		SudoCheck: func() error { return errors.New("sudo: a password is required") },
+		Actions: map[string]ActionHandler{
+			ActStart: func(string) (ActionResult, error) { started = true; return ActionResult{Title: "Tunnel started"}, nil },
+		},
+	})
+	// The startup check has already reported the missing timestamp.
+	updated, _ := model.Update(sudoCheckedMsg{err: errors.New("sudo: a password is required")})
+	model = updated.(appModel)
+	updated, command := model.requestAction(ActStart, "corp", ViewHome)
+	model = updated.(appModel)
+	if command != nil || started || model.outcome.Action != "" {
+		t.Fatalf("start must be parked behind the sudo prompt: cmd=%v started=%v outcome=%+v", command != nil, started, model.outcome)
+	}
+	if model.actionModal == nil || model.actionModal.confirmAction != sudoAuthConfirm || model.sudoPending == nil {
+		t.Fatalf("sudo prompt modal missing: modal=%+v pending=%+v", model.actionModal, model.sudoPending)
+	}
+	if model.sudo != sudoMissing {
+		t.Fatalf("sudo state = %v, want sudoMissing", model.sudo)
+	}
+	// Esc cancels the parked request entirely.
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if model.actionModal != nil || model.sudoPending != nil || started {
+		t.Fatal("skipping sudo should clear the prompt and the pending action")
+	}
+}
+
+func TestSudoAuthenticationResumesParkedStart(t *testing.T) {
+	cached := false
+	var started bool
+	model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{
+		SudoCheck: func() error {
+			if cached {
+				return nil
+			}
+			return errors.New("sudo: a password is required")
+		},
+		SudoAuthenticate: func() *exec.Cmd { cached = true; return exec.Command("true") },
+		Actions: map[string]ActionHandler{
+			ActStart: func(string) (ActionResult, error) { started = true; return ActionResult{Title: "Tunnel started"}, nil },
+		},
+	})
+	updated, _ := model.requestAction(ActStart, "corp", ViewHome)
+	model = updated.(appModel)
+	// Enter hands the terminal to sudo: the modal clears and an
+	// ExecProcess command is produced (not executed here).
+	updated, authCommand := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(appModel)
+	if authCommand == nil || model.actionModal != nil || model.sudoPending == nil {
+		t.Fatalf("enter must schedule sudo and keep the pending action: cmd=%v modal=%v pending=%v", authCommand != nil, model.actionModal, model.sudoPending)
+	}
+	// sudo exits successfully; the UI re-verifies the timestamp.
+	updated, verifyCommand := model.Update(sudoAuthDoneMsg{err: nil})
+	model = updated.(appModel)
+	if model.sudo != sudoUnknown || verifyCommand == nil {
+		t.Fatalf("after auth the timestamp must be re-verified: state=%v cmd=%v", model.sudo, verifyCommand != nil)
+	}
+	updated, startCommand := model.Update(verifyCommand())
+	model = updated.(appModel)
+	if model.sudo != sudoReady || started {
+		t.Fatalf("verified timestamp must mark ready before resuming: state=%v started=%v", model.sudo, started)
+	}
+	if model.actionModal == nil || !model.actionModal.running || model.sudoPending != nil {
+		t.Fatalf("resumed start should be running without a pending request: modal=%+v pending=%v", model.actionModal, model.sudoPending)
+	}
+	// The resume batches the action command with the keep-warm tick;
+	// fan the batch out the way the bubbletea runtime does.
+	if batch, ok := startCommand().(tea.BatchMsg); ok {
+		for _, batched := range batch {
+			updated, _ = model.Update(batched())
+			model = updated.(appModel)
+		}
+	} else {
+		updated, _ = model.Update(startCommand())
+		model = updated.(appModel)
+	}
+	if !started {
+		t.Fatal("parked start did not run after sudo authentication")
+	}
+	// The keep-warm ticker must be armed.
+	updated, warmCommand := model.Update(sudoWarmTickMsg{})
+	model = updated.(appModel)
+	if warmCommand == nil {
+		t.Fatal("keep-warm ticker not armed after authentication")
+	}
+	updated, _ = model.Update(warmCommand())
+	model = updated.(appModel)
+	if model.sudo != sudoReady {
+		t.Fatalf("successful warm refresh must keep state ready: %v", model.sudo)
+	}
+}
+
+func TestSudoWarmExpiryFlagsMissingAgain(t *testing.T) {
+	valid := true
+	model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{
+		SudoCheck: func() error {
+			if valid {
+				return nil
+			}
+			return errors.New("sudo: a password is required")
+		},
+		Actions: map[string]ActionHandler{},
+	})
+	updated, _ := model.Update(sudoCheckedMsg{err: nil})
+	model = updated.(appModel)
+	if model.sudo != sudoReady {
+		t.Fatalf("initial check: state = %v, want sudoReady", model.sudo)
+	}
+	valid = false
+	updated, _ = model.Update(sudoWarmTickMsg{})
+	model = updated.(appModel)
+	updated, _ = model.Update(sudoWarmedMsg{err: errors.New("sudo: a password is required")})
+	model = updated.(appModel)
+	if model.sudo != sudoMissing {
+		t.Fatalf("expired timestamp must flip to missing: %v", model.sudo)
+	}
+	view := model.View()
+	if !strings.Contains(view, "sudo needed") {
+		t.Fatal("status bar must show the sudo warning when the timestamp is missing")
 	}
 }
 

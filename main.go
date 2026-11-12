@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -1087,6 +1088,15 @@ func runBrowser(env *browserEnv) {
 			Summaries:      summaries,
 			Detail:         detail,
 			ConfigSnapshot: configSnapshot,
+			// Cached-sudo management: the TUI cannot let sudo prompt while
+			// it runs, so it verifies the timestamp, offers authentication
+			// with the terminal handed to sudo, and keeps it warm.
+			SudoCheck: func() error {
+				return exec.Command("sudo", "-n", "-v").Run()
+			},
+			SudoAuthenticate: func() *exec.Cmd {
+				return exec.Command("sudo", "-v")
+			},
 			RefreshConfigs: func() ([]*config.Config, error) {
 				return listAllConnections(env.store, env.configRoot)
 			},

@@ -18,6 +18,7 @@ package ui
 import (
 	"fmt"
 	"net/netip"
+	"os/exec"
 	"reflect"
 	"regexp"
 	"strings"
@@ -224,6 +225,12 @@ type RunOptions struct {
 	ScanNew           func(string, string) ([]RescanCandidate, error)
 	PrepareNewRoutes  func(string, string, RescanCandidate) ([]config.NetworkRoute, error)
 	SaveNewConfig     func(*config.Config) error
+	// SudoCheck verifies the cached sudo timestamp noninteractively
+	// (`sudo -n -v`); nil disables all sudo handling (demo mode, tests).
+	// SudoAuthenticate returns the interactive `sudo -v` command the UI
+	// runs via tea.ExecProcess when the user accepts authentication.
+	SudoCheck        func() error
+	SudoAuthenticate func() *exec.Cmd
 }
 
 // RunApp opens the interactive two-level browser and returns its outcome.
@@ -282,6 +289,8 @@ type appModel struct {
 	editor         *connectionEditor
 	rescan         *rescanSelector
 	newWizard      *newConnectionWizard
+	sudo           sudoState
+	sudoPending    *sudoRequest
 	outcome        Outcome
 }
 
@@ -448,6 +457,9 @@ func (m appModel) Init() tea.Cmd {
 	if m.options.RefreshStatus != nil {
 		cmds = append(cmds, m.nextStatusRefresh())
 	}
+	if m.options.SudoCheck != nil {
+		cmds = append(cmds, m.checkSudoCmd())
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -494,6 +506,46 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case statusRefreshedMsg:
 		m.applyRefreshedStatus(message.summaries)
 		return m, m.nextStatusRefresh()
+	case sudoCheckedMsg:
+		if message.err == nil {
+			m.sudo = sudoReady
+			if m.sudoPending != nil {
+				return m.resumeSudoPending()
+			}
+			return m, m.warmSudoCmd()
+		}
+		m.sudo = sudoMissing
+		if m.sudoPending != nil {
+			m.sudoPending = nil
+			m.actionModal = nil
+			m.errorMsg = "sudo is still unavailable (" + message.err.Error() + "); authenticate and start again"
+		}
+		return m, nil
+	case sudoWarmTickMsg:
+		check := m.options.SudoCheck
+		if check == nil || m.sudo != sudoReady {
+			return m, nil
+		}
+		return m, func() tea.Msg { return sudoWarmedMsg{err: check()} }
+	case sudoWarmedMsg:
+		if message.err == nil {
+			return m, m.warmSudoCmd()
+		}
+		// The timestamp expired and could not be refreshed silently:
+		// surface the need on the status bar; the next start offers auth.
+		m.sudo = sudoMissing
+		return m, nil
+	case sudoAuthDoneMsg:
+		if message.err != nil {
+			m.sudo = sudoMissing
+			m.sudoPending = nil
+			m.actionModal = nil
+			m.errorMsg = "sudo authentication failed: " + message.err.Error()
+			return m, nil
+		}
+		// Re-verify instead of assuming: only a confirmed timestamp
+		// resumes the parked action and starts the keep-warm ticker.
+		return m, m.checkSudoCmd()
 	case configRefreshedMsg:
 		if message.err != nil {
 			if m.errorMsg == "" {
@@ -756,6 +808,24 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.actionModal != nil {
 			if m.actionModal.confirmAction != "" {
+				if m.actionModal.confirmAction == sudoAuthConfirm {
+					if key == "esc" || key == "n" {
+						m.sudoPending = nil
+						m.actionModal = nil
+						return m, nil
+					}
+					if key == "enter" || key == "y" {
+						if m.options.SudoAuthenticate == nil {
+							m.sudoPending = nil
+							m.actionModal = nil
+							m.errorMsg = "sudo is needed but cannot be prompted; run `sudo -v` before opening the browser"
+							return m, nil
+						}
+						m.actionModal = nil
+						return m, m.authenticateSudoCmd()
+					}
+					return m, nil
+				}
 				if key == "esc" || key == "n" {
 					m.actionModal = nil
 					return m, nil
@@ -1253,6 +1323,9 @@ func (m appModel) requestAction(action, connection, view string) (tea.Model, tea
 	}
 	if m.options.Offline && OfflineBlocks(action) {
 		m.errorMsg = "offline — " + action + " needs AWS connectivity (check network / credentials)"
+		return m, nil
+	}
+	if m.guardSudo(action, connection, view) {
 		return m, nil
 	}
 	if action == ActForget || action == ActDNSTeardown {
@@ -2753,6 +2826,12 @@ func (m appModel) chrome() Chrome {
 			chrome.Info = "ended"
 		}
 		chrome.Hints = []Hint{{"esc", "close"}, {"q", "close"}, {"↑/↓", "scroll"}, {"pgup/pgdn", "page"}}
+	}
+	if m.options.SudoCheck != nil && m.sudo == sudoMissing {
+		if chrome.Info != "" {
+			chrome.Info += " · "
+		}
+		chrome.Info += Dot("warn") + " sudo needed"
 	}
 	if m.searching {
 		chrome.SearchOpen = true
