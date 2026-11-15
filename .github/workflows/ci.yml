@@ -47,7 +47,12 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: go build -trimpath -ldflags="-s -w" -o "dist/bastionctl-${GOOS}-${GOARCH}" .
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            VERSION="dev-${GITHUB_SHA:0:12}"
+          fi
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "dist/bastionctl-${GOOS}-${GOARCH}" .
       - uses: actions/upload-artifact@v4
         with:
           name: bastionctl-${{ matrix.goos }}-${{ matrix.goarch }}

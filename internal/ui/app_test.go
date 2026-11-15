@@ -2,11 +2,16 @@ package ui
 
 import (
 	"errors"
-	"os/exec"
+	"fmt"
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
+
+	"bastionctl/internal/project"
+	tea "bastionctl/internal/ui/tea"
 
 	"bastionctl/internal/config"
 )
@@ -139,6 +144,78 @@ func TestSlashSearchFiltersAndOpensConnection(t *testing.T) {
 	}
 }
 
+func TestSearchKeepsDashboardRowsWhenNoMatches(t *testing.T) {
+	model := dashboardTestModel()
+	model.options.Account = ""
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 160, Height: 30})
+	model = updated.(appModel)
+	before := model.dashboardMetaRows()
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	model = updated.(appModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("no-such-connection")})
+	model = updated.(appModel)
+	after := model.dashboardMetaRows()
+	if len(after) != len(before) {
+		t.Fatalf("dashboard rows changed from %v to %v", before, after)
+	}
+	for index := range before {
+		if before[index].Label != after[index].Label {
+			t.Fatalf("dashboard row %d changed: %v to %v", index, before[index], after[index])
+		}
+	}
+	view := model.View()
+	for _, text := range []string{"Method", "DNS", "Bastionctl", "v1.2.3", "connections(no-such-connection)[0]"} {
+		if !strings.Contains(view, text) {
+			t.Fatalf("filtered view missing %q:\n%s", text, view)
+		}
+	}
+}
+
+func TestEscapeClearsScopedSearch(t *testing.T) {
+	detail := &ConnDetail{Name: "corp", Target: "i-123", TargetOK: true}
+	model := newTestApp(nil, RunOptions{Level: 1, Detail: detail})
+	model.searchFilters = map[string]string{searchDetail: "target"}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	model = updated.(appModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("-missing")})
+	model = updated.(appModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if model.searching || model.searchFilters[searchDetail] != "" || model.level() != 1 || !strings.Contains(model.View(), "DNS") {
+		t.Fatalf("escape did not clear scoped search: %q", model.View())
+	}
+	model.searchFilters[searchDetail] = "target"
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if model.searchFilters[searchDetail] != "" || model.level() != 1 || !strings.Contains(model.View(), "DNS") {
+		t.Fatalf("escape did not clear applied detail filter: %q", model.View())
+	}
+}
+
+func TestEscapeClearsActiveAndCommittedHomeFilter(t *testing.T) {
+	model := newTestApp([]ConnSummary{{Name: "corp"}, {Name: "analytics"}}, RunOptions{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	model = updated.(appModel)
+	press := func(message tea.KeyMsg) {
+		t.Helper()
+		updated, _ := model.Update(message)
+		model = updated.(appModel)
+	}
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("missing")})
+	press(tea.KeyMsg{Type: tea.KeyEsc})
+	if model.searching || model.searchFilter != "" || len(model.home.Rows()) != 2 || !strings.Contains(model.View(), "corp") {
+		t.Fatalf("escape did not clear active filter: %q", model.View())
+	}
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("analytics")})
+	press(tea.KeyMsg{Type: tea.KeyEnter})
+	press(tea.KeyMsg{Type: tea.KeyEsc})
+	if model.searchFilter != "" || len(model.home.Rows()) != 2 || model.currentName() != "analytics" {
+		t.Fatalf("escape did not clear committed filter or preserve selection: %q", model.View())
+	}
+}
+
 func TestSlashSearchFiltersConnectionDetails(t *testing.T) {
 	detail := &ConnDetail{Name: "corp", Kind: "vpc", Method: "ssm", Region: "eu-central-1", Target: "i-123", TargetOK: true, SSHPort: 22}
 	model := newTestApp(nil, RunOptions{Level: 1, Detail: detail})
@@ -151,7 +228,8 @@ func TestSlashSearchFiltersConnectionDetails(t *testing.T) {
 	updated, _ = model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	model = updated.(appModel)
 	view := model.View()
-	if !strings.Contains(view, "i-123") || strings.Contains(view, "DNS") || model.searchFilters[searchDetail] != "target" {
+	_, detailView, found := strings.Cut(view, "connection(corp)")
+	if !found || !strings.Contains(detailView, "i-123") || strings.Contains(detailView, "DNS") || model.searchFilters[searchDetail] != "target" {
 		t.Fatalf("connection search did not filter the detail panel: %q", view)
 	}
 }
@@ -226,9 +304,14 @@ func TestSlashSearchFiltersAndHighlightsLogs(t *testing.T) {
 
 func TestHomeHintsIncludeLaunch(t *testing.T) {
 	model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{})
-	view := model.chrome().View("", 120, 24)
-	if !strings.Contains(view, "launch") {
-		t.Fatalf("home hints missing launch action:\n%s", view)
+	found := false
+	for _, hint := range model.chrome().Hints {
+		if hint.Key == "a" && hint.Label == "launch" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("home hints missing launch action: %v", model.chrome().Hints)
 	}
 }
 
@@ -255,25 +338,467 @@ func TestShellOpenRendersInputBar(t *testing.T) {
 		t.Fatal(": must open the command line")
 	}
 	view := model.View()
-	if !strings.Contains(view, "▏") {
+	if !strings.Contains(view, "|") {
 		t.Fatalf("empty input bar missing from view:\n%s", view)
 	}
-	for _, expected := range []string{"start", "stop", "rescan"} {
-		if !strings.Contains(view, expected) {
-			t.Fatalf("suggestion line missing %q:\n%s", expected, view)
-		}
+	if !strings.Contains(ansiEscapePattern.ReplaceAllString(view, ""), ":|start") {
+		t.Fatalf("inline suggestion missing:\n%s", view)
 	}
 	// Typed characters show up immediately.
 	updated, _ = model.updateShell("stop", runesOf("stop"))
 	model = updated.(appModel)
-	if view := model.View(); !strings.Contains(view, "stop") || !strings.Contains(view, "▏") {
+	if view := model.View(); !strings.Contains(view, "stop") || !strings.Contains(view, "|") {
 		t.Fatalf("typed input missing:\n%s", view)
 	}
 }
 
+func TestShellInlineCompletion(t *testing.T) {
+	model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	model = updated.(appModel)
+	model.shell = true
+	model.shellInput = "st"
+	view := ansiEscapePattern.ReplaceAllString(model.View(), "")
+	if !strings.Contains(view, ":st|art") || model.shellInput != "st" {
+		t.Fatalf("inline suggestion changed input or is missing:\n%s", view)
+	}
+	updated, _ = model.updateShell("tab", nil)
+	model = updated.(appModel)
+	if model.shellInput != "start " || !strings.Contains(ansiEscapePattern.ReplaceAllString(model.View(), ""), ":start |corp") {
+		t.Fatalf("tab did not accept suggested command: input=%q view=%q", model.shellInput, model.View())
+	}
+	updated, _ = model.updateShell("tab", nil)
+	model = updated.(appModel)
+	if model.shellInput != "start corp " {
+		t.Fatalf("tab did not complete connection: %q", model.shellInput)
+	}
+	model.shellInput = "dns i"
+	if !strings.Contains(ansiEscapePattern.ReplaceAllString(model.View(), ""), ":dns i|nstall") {
+		t.Fatalf("DNS completion missing: %q", model.View())
+	}
+	model.shellInput = "unmatched"
+	updated, _ = model.updateShell("tab", nil)
+	model = updated.(appModel)
+	if model.shellInput != "unmatched" || !strings.Contains(ansiEscapePattern.ReplaceAllString(model.View(), ""), ":unmatched|") {
+		t.Fatalf("unmatched input changed: %q", model.shellInput)
+	}
+}
+
+func TestShellCompletesDNSAndUnicodeConnections(t *testing.T) {
+	model := newTestApp([]ConnSummary{{Name: "café-edge"}}, RunOptions{})
+	model.shell = true
+	model.shellInput = "dns i"
+	updated, _ := model.updateShell("tab", nil)
+	model = updated.(appModel)
+	if model.shellInput != "dns install " {
+		t.Fatalf("DNS action completion = %q", model.shellInput)
+	}
+	updated, _ = model.updateShell("tab", nil)
+	model = updated.(appModel)
+	if model.shellInput != "dns install café-edge " {
+		t.Fatalf("DNS connection completion = %q", model.shellInput)
+	}
+	model.shellInput = "logs café"
+	updated, _ = model.updateShell("backspace", nil)
+	model = updated.(appModel)
+	if model.shellInput != "logs caf" {
+		t.Fatalf("Unicode backspace = %q", model.shellInput)
+	}
+	updated, _ = model.updateShell("tab", nil)
+	model = updated.(appModel)
+	if model.shellInput != "logs café-edge " {
+		t.Fatalf("Unicode connection completion = %q", model.shellInput)
+	}
+}
+
+func TestShellAutocompleteUsesOnePromptRow(t *testing.T) {
+	base := Chrome{Hints: []Hint{{"q", "quit"}}}
+	command := base
+	command.ShellOpen = true
+	command.Shell = "st"
+	command.ShellSuggestions = []string{"start", "stop"}
+	if got := base.Budget(20, 80) - command.Budget(20, 80); got != 1 {
+		t.Fatalf("command prompt uses %d extra rows, want 1", got)
+	}
+	view := ansiEscapePattern.ReplaceAllString(command.View("┌─ connections(all)[1] ─┐", 80, 20), "")
+	rows := strings.Split(view, "\n")
+	for index, row := range rows {
+		if strings.Contains(row, "connections(all)") {
+			if index == 0 || !strings.Contains(rows[index-1], ":st|art") {
+				t.Fatalf("inline prompt not immediately above panel:\n%s", view)
+			}
+			return
+		}
+	}
+	t.Fatalf("panel missing:\n%s", view)
+}
+
+func TestShellAutocompleteFitsNarrowWidths(t *testing.T) {
+	for _, width := range []int{1, 2, 8, 20} {
+		prompt := renderCommandPrompt(":", "st", []string{"start-界界界"}, width)
+		if cells := lipgloss.Width(prompt); cells > width {
+			t.Fatalf("width %d: autocomplete uses %d cells: %q", width, cells, prompt)
+		}
+	}
+}
+
+func TestChromePromptsPrecedePanel(t *testing.T) {
+	for _, chrome := range []Chrome{
+		{Hints: []Hint{{"q", "quit"}}, SearchOpen: true, Search: "corp"},
+		{Hints: []Hint{{"q", "quit"}}, ShellOpen: true, Shell: "stop"},
+	} {
+		view := ansiEscapePattern.ReplaceAllString(chrome.View("┌─ connections(all)[4] ─┐", 80, 10), "")
+		lines := strings.Split(view, "\n")
+		panel := -1
+		for index, line := range lines {
+			if strings.Contains(line, "connections(all)[4]") {
+				panel = index
+			}
+		}
+		if panel < 1 || !(strings.Contains(lines[panel-1], "/corp") || strings.Contains(lines[panel-1], ":stop")) {
+			t.Fatalf("prompt not immediately above panel: %q", view)
+		}
+		if len(lines) != 10 {
+			t.Fatalf("got %d lines, want 10: %q", len(lines), view)
+		}
+	}
+}
+
+func TestChromeAlignsDashboardAndShortcuts(t *testing.T) {
+	chrome := Chrome{
+		Dashboard: []string{"Profile    default", "Selected   corp", "Version    dev"},
+		Hints:     []Hint{{"enter", "open"}, {"n", "new"}, {"s", "start"}, {"q", "quit"}},
+	}
+	rows := chrome.headerRows(120, 24)
+	if len(rows) != 3 || !strings.Contains(rows[0], "Profile") || !strings.Contains(rows[0], "<enter>") || !strings.Contains(rows[0], "BASTIONCTL") {
+		t.Fatalf("header columns not aligned: %q", rows)
+	}
+	if got := chrome.Budget(24, 120); got != 20 {
+		t.Fatalf("body budget = %d, want 20", got)
+	}
+}
+
+func TestChromeShortcutsUseExtraWidth(t *testing.T) {
+	chrome := Chrome{Info: "ready", Hints: []Hint{{"a", "one"}, {"b", "two"}, {"c", "three"}, {"q", "quit"}}}
+	spacing := func(width int) int {
+		row := ansiEscapePattern.ReplaceAllString(chrome.headerRows(width, 24)[0], "")
+		beforeFirst, _, firstFound := strings.Cut(row, "<a>")
+		beforeSecond, _, secondFound := strings.Cut(row, "<b>")
+		if !firstFound || !secondFound {
+			t.Fatalf("shortcuts missing at width %d: %q", width, row)
+		}
+		return lipgloss.Width(beforeSecond) - lipgloss.Width(beforeFirst)
+	}
+	if spacing(160) <= spacing(120) {
+		t.Fatal("shortcuts did not spread across additional width")
+	}
+}
+
+func TestChromeLogoKeepsRightMargin(t *testing.T) {
+	chrome := Chrome{Info: "ready", Hints: []Hint{{"q", "quit"}}}
+	for _, width := range []int{80, 100, 120, 160} {
+		row := ansiEscapePattern.ReplaceAllString(chrome.headerRows(width, 24)[0], "")
+		if !strings.Contains(row, "BASTIONCTL") || !strings.HasSuffix(row, "  ") || lipgloss.Width(row) > width {
+			t.Fatalf("width %d: logo clipped or missing margin: %q", width, row)
+		}
+	}
+}
+
+func TestChromeProjectFooterFits(t *testing.T) {
+	t.Setenv("BASTIONCTL_NO_ICONS", "")
+	t.Setenv("TERM_PROGRAM", "")
+	for _, size := range [][2]int{{40, 12}, {80, 18}, {120, 24}} {
+		chrome := Chrome{Info: "ready", Hints: []Hint{{"q", "quit"}}}
+		view := chrome.View("panel", size[0], size[1])
+		rows := strings.Split(view, "\n")
+		footer := ansiEscapePattern.ReplaceAllString(rows[len(rows)-1], "")
+		if len(rows) != size[1] || !strings.HasSuffix(footer, "\uf408 "+project.Repository) || lipgloss.Width(footer) != size[0] {
+			t.Fatalf("size %v: invalid footer %q in %d rows", size, footer, len(rows))
+		}
+	}
+}
+
+func TestChromeProjectFooterCompactFallback(t *testing.T) {
+	t.Setenv("BASTIONCTL_NO_ICONS", "")
+	t.Setenv("TERM_PROGRAM", "")
+	for _, test := range []struct {
+		width int
+		want  string
+	}{{1, "\uf408"}, {12, "\uf408 bastionctl"}, {20, "\uf408 bastionctl"}} {
+		view := (Chrome{}).View("panel", test.width, 8)
+		rows := strings.Split(view, "\n")
+		footer := ansiEscapePattern.ReplaceAllString(rows[len(rows)-1], "")
+		if strings.TrimSpace(footer) != test.want || len(rows) != 8 {
+			t.Fatalf("width %d: footer %q in %d rows", test.width, footer, len(rows))
+		}
+	}
+}
+
+func TestChromeProjectFooterPlainTextFallback(t *testing.T) {
+	t.Setenv("BASTIONCTL_NO_ICONS", "1")
+	for _, test := range []struct {
+		width int
+		want  string
+	}{{1, "g"}, {12, "gh"}, {20, "gh bastionctl"}, {80, "gh " + project.Repository}} {
+		view := (Chrome{}).View("panel", test.width, 8)
+		rows := strings.Split(view, "\n")
+		footer := ansiEscapePattern.ReplaceAllString(rows[len(rows)-1], "")
+		if strings.TrimSpace(footer) != test.want || lipgloss.Width(footer) > test.width {
+			t.Fatalf("width %d: unexpected plain-text footer %q", test.width, footer)
+		}
+	}
+}
+
+func TestChromeProjectFooterITermFallback(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	t.Setenv("BASTIONCTL_NO_ICONS", "")
+	t.Setenv("BASTIONCTL_ICONS", "")
+	footer := func() string {
+		view := (Chrome{}).View("panel", 80, 8)
+		rows := strings.Split(view, "\n")
+		return ansiEscapePattern.ReplaceAllString(rows[len(rows)-1], "")
+	}
+	if got := footer(); !strings.HasSuffix(got, "gh "+project.Repository) {
+		t.Fatalf("iTerm footer did not use plain text: %q", got)
+	}
+	t.Setenv("BASTIONCTL_ICONS", "1")
+	if got := footer(); !strings.HasSuffix(got, "\uf408 "+project.Repository) {
+		t.Fatalf("iTerm opt-in did not enable the icon: %q", got)
+	}
+	t.Setenv("BASTIONCTL_NO_ICONS", "1")
+	if got := footer(); !strings.HasSuffix(got, "gh "+project.Repository) {
+		t.Fatalf("explicit plain-text fallback did not take priority: %q", got)
+	}
+}
+
+func TestProjectFooterReachesTerminalRenderer(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		noIcons     string
+		icons       string
+		termProgram string
+		mark        string
+	}{
+		{name: "octocat", mark: "\uf408"},
+		{name: "plain", noIcons: "1", mark: "gh"},
+		{name: "iterm", termProgram: "iTerm.app", mark: "gh"},
+		{name: "iterm with font", termProgram: "iTerm.app", icons: "1", mark: "\uf408"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("BASTIONCTL_NO_ICONS", test.noIcons)
+			t.Setenv("BASTIONCTL_ICONS", test.icons)
+			t.Setenv("TERM_PROGRAM", test.termProgram)
+			screen := tcell.NewSimulationScreen("UTF-8")
+			if err := screen.Init(); err != nil {
+				t.Fatal(err)
+			}
+			defer screen.Fini()
+			screen.SetSize(80, 8)
+			view := tview.NewTextView().SetDynamicColors(true).SetWrap(false)
+			view.SetRect(0, 0, 80, 8)
+			view.SetText(tview.TranslateANSI(tview.Escape((Chrome{}).View("panel", 80, 8))))
+			view.Draw(screen)
+			column := 80 - lipgloss.Width(test.mark+" "+project.Repository)
+			character, _, _, _ := screen.GetContent(column, 7)
+			if character != []rune(test.mark)[0] {
+				t.Fatalf("footer glyph = %q, want %q", character, test.mark)
+			}
+		})
+	}
+}
+
+func TestCaptureSenderLivesUntilRunAppCleanup(t *testing.T) {
+	var captured func(Message)
+	send := func(Message) {}
+	cleanup := registerCaptureSender(func(next func(Message)) { captured = next }, send)
+	if captured == nil {
+		t.Fatal("sender not registered")
+	}
+	cleanup()
+	if captured != nil {
+		t.Fatal("sender not cleared during RunApp cleanup")
+	}
+}
+
+func TestProjectFooterAppearsAcrossViews(t *testing.T) {
+	t.Setenv("BASTIONCTL_NO_ICONS", "")
+	t.Setenv("TERM_PROGRAM", "")
+	model := dashboardTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	model = updated.(appModel)
+	views := []struct {
+		name  string
+		apply func(*appModel)
+	}{
+		{"home", func(*appModel) {}},
+		{"connection", func(m *appModel) { m.options.Level = 1; m.options.Detail = &ConnDetail{Name: "corp"} }},
+		{"editor", func(m *appModel) { m.editor = newConnectionEditor(&config.Config{Name: "corp", SSHPort: 22}, nil) }},
+		{"yaml", func(m *appModel) {
+			m.editor = newConnectionEditor(&config.Config{Name: "corp", SSHPort: 22}, nil)
+			if err := enterYAMLEditor(m.editor); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"rescan", func(m *appModel) { m.rescan = &rescanSelector{connection: "corp"} }},
+		{"wizard", func(m *appModel) { m.newWizard = &newConnectionWizard{step: "kind"} }},
+		{"logs", func(m *appModel) { m.logSession = &LogSession{} }},
+		{"help", func(m *appModel) { m.help = true }},
+		{"command", func(m *appModel) { m.shell = true }},
+		{"search", func(m *appModel) { m.beginSearch() }},
+		{"notice", func(m *appModel) { m.setError("notice") }},
+		{"action", func(m *appModel) { m.actionModal = &actionModal{title: "Action failed", body: "error"} }},
+		{"password", func(m *appModel) { m.sudoPrompt = &sudoPasswordPrompt{} }},
+	}
+	for _, view := range views {
+		current := model
+		view.apply(&current)
+		rows := strings.Split(current.View(), "\n")
+		footer := ansiEscapePattern.ReplaceAllString(rows[len(rows)-1], "")
+		if len(rows) != current.height || !strings.HasSuffix(footer, "\uf408 "+project.Repository) {
+			t.Fatalf("%s: project footer missing or frame height changed: %q", view.name, rows[len(rows)-1])
+		}
+	}
+}
+
+func TestChromeLogoUsesCompactHeaderSpace(t *testing.T) {
+	chrome := Chrome{Info: "ready", Hints: []Hint{{"q", "quit"}}}
+	for _, width := range []int{120, 160} {
+		rows := chrome.headerRows(width, 24)
+		if len(rows) < 3 {
+			t.Fatalf("width %d: compact logo missing rows: %q", width, rows)
+		}
+		for index, expected := range []string{"BASTIONCTL", "╔═╦═╗", "╚═╬═╝"} {
+			plain := ansiEscapePattern.ReplaceAllString(rows[index], "")
+			if !strings.Contains(plain, expected) || lipgloss.Width(plain) > width {
+				t.Fatalf("width %d: logo row %d missing %q: %q", width, index, expected, plain)
+			}
+		}
+	}
+}
+
+func TestChromeLogoFillsAvailableHeaderHeight(t *testing.T) {
+	model := dashboardTestModel()
+	for _, width := range []int{80} {
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: width, Height: 30})
+		model = updated.(appModel)
+		rows := model.chrome().headerRows(width, 30)
+		if len(rows) < 7 {
+			t.Fatalf("width %d: expected room for a tall logo, got %d rows", width, len(rows))
+		}
+		for index, expected := range []string{"BASTIONCTL", "╔╦═╦═╦╗", "║     ║", "║ ╔═╗ ║", "║ ║ ║ ║", "╚═╝ ╚═╝", "║"} {
+			plain := ansiEscapePattern.ReplaceAllString(rows[index], "")
+			if !strings.Contains(plain, expected) || lipgloss.Width(plain) > width {
+				t.Fatalf("width %d: logo row %d missing %q: %q", width, index, expected, plain)
+			}
+		}
+	}
+}
+
+func TestChromeLargeLogoUsesHeaderSpace(t *testing.T) {
+	model := dashboardTestModel()
+	for _, width := range []int{110, 120, 150, 160, 200} {
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: width, Height: 30})
+		model = updated.(appModel)
+		rows := model.chrome().headerRows(width, 30)
+		for index, expected := range []string{"BASTIONCTL", "╔═╗ ╔═╗ ╔═╗ ╔═╗", "║ ╚═╝ ╚═╝ ╚═╝ ║", "║    ╔═══╗    ║", "║    ║ ╬ ║    ║", "╚════╣ ║ ╠════╝", "╚═╩═╝"} {
+			plain := ansiEscapePattern.ReplaceAllString(rows[index], "")
+			before, _, found := strings.Cut(plain, expected)
+			if !found || lipgloss.Width(before) < width-30 || lipgloss.Width(plain) > width {
+				t.Fatalf("width %d: large logo row %d misplaced: %q", width, index, plain)
+			}
+		}
+	}
+}
+
+func TestChromeLargeLogoWallsAlign(t *testing.T) {
+	model := dashboardTestModel()
+	for _, width := range []int{110, 120, 160, 200} {
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: width, Height: 30})
+		model = updated.(appModel)
+		rows := model.chrome().headerRows(width, 30)
+		left, right := -1, -1
+		for index, ends := range [][2]string{{"╔", "╗"}, {"║", "║"}, {"║", "║"}, {"║", "║"}, {"╚", "╝"}} {
+			line := ansiEscapePattern.ReplaceAllString(rows[index+1], "")
+			first, last := strings.Index(line, ends[0]), strings.LastIndex(line, ends[1])
+			if first < 0 || last < 0 {
+				t.Fatalf("width %d: missing wall on row %d: %q", width, index+1, line)
+			}
+			firstColumn, lastColumn := lipgloss.Width(line[:first]), lipgloss.Width(line[:last])
+			if index == 0 {
+				left, right = firstColumn, lastColumn
+			} else if firstColumn != left || lastColumn != right {
+				t.Fatalf("width %d: row %d walls at %d/%d, want %d/%d", width, index+1, firstColumn, lastColumn, left, right)
+			}
+		}
+		gateColumn := -1
+		for index, gate := range []string{"╔═══╗", "║ ╬ ║", "╣ ║ ╠", "╚═╩═╝"} {
+			line := ansiEscapePattern.ReplaceAllString(rows[index+3], "")
+			before, _, found := strings.Cut(line, gate)
+			if !found {
+				t.Fatalf("width %d: missing gate on row %d: %q", width, index+3, line)
+			}
+			column := lipgloss.Width(before)
+			if index == 0 {
+				gateColumn = column
+			} else if column != gateColumn {
+				t.Fatalf("width %d: gate row %d starts at %d, want %d", width, index+3, column, gateColumn)
+			}
+		}
+	}
+}
+
+func TestChromePacksShortcutsOnNarrowDashboard(t *testing.T) {
+	model := dashboardTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 90, Height: 24})
+	model = updated.(appModel)
+	chrome := model.chrome()
+	rows := chrome.headerRows(90, 24)
+	if len(rows) > 9 {
+		t.Fatalf("shortcut header uses %d rows, want at most 9", len(rows))
+	}
+	plain := ansiEscapePattern.ReplaceAllString(strings.Join(rows, "\n"), "")
+	for _, hint := range chrome.Hints {
+		if !strings.Contains(plain, "<"+hint.Key+">") {
+			t.Fatalf("shortcut %q missing from header:\n%s", hint.Key, plain)
+		}
+	}
+}
+
+func TestChromePacksShortcutsOnCompactDashboard(t *testing.T) {
+	model := dashboardTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	model = updated.(appModel)
+	chrome := model.chrome()
+	rows := chrome.headerRows(80, 30)
+	if len(rows) > 9 {
+		t.Fatalf("80-column header uses %d rows, want at most 9", len(rows))
+	}
+	plain := ansiEscapePattern.ReplaceAllString(strings.Join(rows, "\n"), "")
+	for _, hint := range chrome.Hints {
+		if !strings.Contains(plain, "<"+hint.Key+">") {
+			t.Fatalf("shortcut %q missing from compact header:\n%s", hint.Key, plain)
+		}
+	}
+}
+
+func TestChromePromptFitsTerminal(t *testing.T) {
+	for _, width := range []int{40, 80, 120} {
+		for _, chrome := range []Chrome{
+			{SearchOpen: true, Search: strings.Repeat("界", width)},
+			{ShellOpen: true, Shell: strings.Repeat("界", width)},
+		} {
+			view := chrome.View("panel", width, 12)
+			for _, row := range strings.Split(view, "\n") {
+				if cells := lipgloss.Width(row); cells > width {
+					t.Fatalf("width %d: row occupies %d cells: %q", width, cells, row)
+				}
+			}
+		}
+	}
+}
+
 func TestShellErrorsShowWhileShellOpen(t *testing.T) {
-	// A parse error must not hide the input bar: the error replaces the
-	// suggestion line while the shell stays open.
+	// A parse error must not hide the input bar while the error is overlaid.
 	model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{})
 	model.shell = true
 	updated, _ := model.updateShell(":", nil)
@@ -289,7 +814,7 @@ func TestShellErrorsShowWhileShellOpen(t *testing.T) {
 	if !strings.Contains(view, "unknown command") {
 		t.Fatalf("error line missing from view:\n%s", view)
 	}
-	if !strings.Contains(view, "frobnicate") || !strings.Contains(view, "▏") {
+	if !strings.Contains(view, "frobnicate") || !strings.Contains(view, "|") {
 		t.Fatalf("input bar missing from view:\n%s", view)
 	}
 }
@@ -370,6 +895,170 @@ func TestRegisteredActionShowsProgressAndResultModal(t *testing.T) {
 	model = updated.(appModel)
 	if model.actionModal != nil || model.outcome.Action != "" {
 		t.Fatalf("auto-dismiss changed app state: modal = %+v, outcome = %+v", model.actionModal, model.outcome)
+	}
+}
+
+func TestActionNotificationKeepsDashboardAndTablePosition(t *testing.T) {
+	model := dashboardTestModel()
+	model.options.Actions = map[string]ActionHandler{
+		ActStatus: func(string) (ActionResult, error) {
+			return ActionResult{}, errors.New("status unavailable")
+		},
+	}
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 160, Height: 30})
+	model = updated.(appModel)
+	position := func() int {
+		t.Helper()
+		view := ansiEscapePattern.ReplaceAllString(model.View(), "")
+		if !strings.Contains(view, "Profile") || !strings.Contains(view, "Selected") {
+			t.Fatalf("dashboard disappeared:\n%s", view)
+		}
+		for index, line := range strings.Split(view, "\n") {
+			if strings.Contains(line, "connections(all)") {
+				return index
+			}
+		}
+		t.Fatalf("connections title missing:\n%s", view)
+		return -1
+	}
+	before := position()
+	updated, command := model.updateHomeLevel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")}, "i")
+	model = updated.(appModel)
+	if got := position(); got != before {
+		t.Fatalf("table moved during action: got %d, want %d", got, before)
+	}
+	updated, _ = model.Update(command())
+	model = updated.(appModel)
+	if got := position(); got != before || !strings.Contains(model.View(), "status unavailable") {
+		t.Fatalf("error notification moved table or disappeared: row %d, want %d", got, before)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if got := position(); got != before {
+		t.Fatalf("table moved after dismissal: got %d, want %d", got, before)
+	}
+}
+
+func TestActionNotificationFitsMainPanel(t *testing.T) {
+	for _, size := range [][2]int{{40, 12}, {80, 16}, {90, 18}, {120, 24}, {160, 30}} {
+		model := dashboardTestModel()
+		model.options.Actions = map[string]ActionHandler{
+			ActStatus: func(string) (ActionResult, error) { return ActionResult{}, errors.New("status unavailable") },
+		}
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		model = updated.(appModel)
+		updated, command := model.updateHomeLevel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")}, "i")
+		model = updated.(appModel)
+		updated, _ = model.Update(command())
+		model = updated.(appModel)
+		view := model.View()
+		if !strings.Contains(view, "status unavailable") {
+			t.Fatalf("size %v: notification missing: %q", size, view)
+		}
+		rows := strings.Split(view, "\n")
+		if len(rows) > size[1] {
+			t.Fatalf("size %v: notification produced %d rows", size, len(rows))
+		}
+		for _, row := range rows {
+			if cells := lipgloss.Width(row); cells > size[0] {
+				t.Fatalf("size %v: notification row is %d cells: %q", size, cells, row)
+			}
+		}
+	}
+}
+
+func TestTransientNoticeKeepsPanelSize(t *testing.T) {
+	model := dashboardTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	model = updated.(appModel)
+	before := model.View()
+	beforeBudget := model.chrome().Budget(model.height, model.width)
+	model.setError("status unavailable")
+	after := model.View()
+	if model.chrome().Budget(model.height, model.width) != beforeBudget {
+		t.Fatal("notice changed panel budget")
+	}
+	if strings.Count(before, "\n") != strings.Count(after, "\n") || !strings.Contains(after, "status unavailable") {
+		t.Fatalf("notice changed frame height or disappeared:\n%s", after)
+	}
+	beforeRows, afterRows := strings.Split(before, "\n"), strings.Split(after, "\n")
+	for index, line := range beforeRows {
+		if strings.Contains(line, "connections(all)") && line != afterRows[index] {
+			t.Fatalf("notice moved or changed table title: %q", afterRows[index])
+		}
+	}
+}
+
+func TestDashboardTracksSelectedAccountDuringNotifications(t *testing.T) {
+	summaries := []ConnSummary{
+		{Name: "shared", Account: "123456789012"},
+		{Name: "shared", Account: "014498740021"},
+		{Name: "other", Account: "999999999999"},
+	}
+	model := newTestApp(summaries, RunOptions{
+		Account: "123456789012 (prod) · 014498740021 (staging)",
+		AccountLabels: map[string]string{
+			"123456789012": "123456789012 (prod)",
+			"014498740021": "014498740021 (staging)",
+		},
+		Actions: map[string]ActionHandler{
+			ActStatus: func(string) (ActionResult, error) { return ActionResult{}, errors.New("status unavailable") },
+		},
+	})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 160, Height: 30})
+	model = updated.(appModel)
+	account := func() string {
+		for _, row := range model.dashboardMetaRows() {
+			if row.Label == "Account" {
+				return row.Value
+			}
+		}
+		return ""
+	}
+	if got := account(); got != "123456789012 (prod)" {
+		t.Fatalf("first account = %q", got)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(appModel)
+	if got := account(); got != "014498740021 (staging)" {
+		t.Fatalf("selected account = %q", got)
+	}
+	before := strings.Join(model.chrome().Dashboard, "\n")
+	headerBefore := strings.Join(model.chrome().headerRows(model.width, model.height), "\n")
+	updated, command := model.updateHomeLevel(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")}, "i")
+	model = updated.(appModel)
+	updated, _ = model.Update(command())
+	model = updated.(appModel)
+	if got := strings.Join(model.chrome().Dashboard, "\n"); got != before {
+		t.Fatal("action notification changed selected connection metadata")
+	}
+	model.setError("notice")
+	model.sudoPrompt = &sudoPasswordPrompt{}
+	if got := strings.Join(model.chrome().Dashboard, "\n"); got != before {
+		t.Fatal("notification or authorization prompt changed dashboard metadata")
+	}
+	if got := strings.Join(model.chrome().headerRows(model.width, model.height), "\n"); got != headerBefore {
+		t.Fatal("authorization prompt changed the header layout")
+	}
+	model.sudoPrompt, model.actionModal = nil, nil
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(appModel)
+	if got := account(); got != "999999999999" {
+		t.Fatalf("unknown account alias: got %q, want account ID", got)
+	}
+}
+
+func TestConfigRefreshKeepsSelectedAccountDuringNotification(t *testing.T) {
+	first := &config.Config{Name: "shared", AccountID: "123456789012", SSHPort: 22}
+	second := &config.Config{Name: "shared", AccountID: "014498740021", SSHPort: 22}
+	model := newTestApp([]ConnSummary{{Name: first.Name, Account: first.AccountID}, {Name: second.Name, Account: second.AccountID}}, RunOptions{})
+	model.knownConfigs = []*config.Config{first, second}
+	model.home.SetCursor(1)
+	model.actionModal = &actionModal{title: "Action failed", body: "status unavailable"}
+	model.applyRefreshedConfigs([]*config.Config{second, first})
+	selected, ok := model.dashboardSelection()
+	if !ok || selected.Account != second.AccountID || model.home.Cursor() != 0 {
+		t.Fatalf("refresh changed selected account: selected=%+v cursor=%d", selected, model.home.Cursor())
 	}
 }
 
@@ -553,7 +1242,6 @@ func TestStartAsksForSudoWhenTimestampMissing(t *testing.T) {
 
 func TestSudoAuthenticationResumesParkedStart(t *testing.T) {
 	cached := false
-	var started bool
 	model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{
 		SudoCheck: func() error {
 			if cached {
@@ -561,47 +1249,45 @@ func TestSudoAuthenticationResumesParkedStart(t *testing.T) {
 			}
 			return errors.New("sudo: a password is required")
 		},
-		SudoAuthenticate: func() *exec.Cmd { cached = true; return exec.Command("true") },
+		SudoAuthenticate: func(password string) error {
+			cached = password == "secret"
+			return nil
+		},
 		Actions: map[string]ActionHandler{
-			ActStart: func(string) (ActionResult, error) { started = true; return ActionResult{Title: "Tunnel started"}, nil },
+			ActStart: func(string) (ActionResult, error) { return ActionResult{Title: "Tunnel started"}, nil },
 		},
 	})
 	updated, _ := model.requestAction(ActStart, "corp", ViewHome)
 	model = updated.(appModel)
-	// Enter hands the terminal to sudo: the modal clears and an
-	// ExecProcess command is produced (not executed here).
-	updated, authCommand := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	// Enter opens a masked password prompt inside the TUI.
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(appModel)
-	if authCommand == nil || model.actionModal != nil || model.sudoPending == nil {
-		t.Fatalf("enter must schedule sudo and keep the pending action: cmd=%v modal=%v pending=%v", authCommand != nil, model.actionModal, model.sudoPending)
+	if model.sudoPrompt == nil || !model.sudoPrompt.authenticate || model.actionModal != nil || model.sudoPending == nil {
+		t.Fatalf("enter must open password prompt and keep pending action: prompt=%v modal=%v pending=%v", model.sudoPrompt != nil, model.actionModal, model.sudoPending)
 	}
-	// sudo exits successfully; the UI re-verifies the timestamp.
-	updated, verifyCommand := model.Update(sudoAuthDoneMsg{err: nil})
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("secret")})
+	model = updated.(appModel)
+	var authCommand tea.Cmd
+	updated, authCommand = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(appModel)
+	if authCommand == nil || model.sudoPrompt != nil {
+		t.Fatal("password submit did not start background sudo validation")
+	}
+	updated, verifyCommand := model.Update(authCommand())
 	model = updated.(appModel)
 	if model.sudo != sudoUnknown || verifyCommand == nil {
 		t.Fatalf("after auth the timestamp must be re-verified: state=%v cmd=%v", model.sudo, verifyCommand != nil)
 	}
 	updated, startCommand := model.Update(verifyCommand())
 	model = updated.(appModel)
-	if model.sudo != sudoReady || started {
-		t.Fatalf("verified timestamp must mark ready before resuming: state=%v started=%v", model.sudo, started)
+	if model.sudo != sudoReady {
+		t.Fatalf("verified timestamp must mark ready before resuming: state=%v", model.sudo)
 	}
 	if model.actionModal == nil || !model.actionModal.running || model.sudoPending != nil {
 		t.Fatalf("resumed start should be running without a pending request: modal=%+v pending=%v", model.actionModal, model.sudoPending)
 	}
-	// The resume batches the action command with the keep-warm tick;
-	// fan the batch out the way the bubbletea runtime does.
-	if batch, ok := startCommand().(tea.BatchMsg); ok {
-		for _, batched := range batch {
-			updated, _ = model.Update(batched())
-			model = updated.(appModel)
-		}
-	} else {
-		updated, _ = model.Update(startCommand())
-		model = updated.(appModel)
-	}
-	if !started {
-		t.Fatal("parked start did not run after sudo authentication")
+	if startCommand == nil {
+		t.Fatal("parked start and keep-warm commands were not scheduled")
 	}
 	// The keep-warm ticker must be armed.
 	updated, warmCommand := model.Update(sudoWarmTickMsg{})
@@ -700,7 +1386,7 @@ func TestEditorShowsActiveFieldAndCaret(t *testing.T) {
 	editor.field = 4
 	editor.input = editor.values[4]
 	view := renderEditor(editor, 8, "")
-	for _, expected := range []string{"EDIT CONNECTION · corp", "Field 5/19 · target", "▶ target", "▏"} {
+	for _, expected := range []string{"NORMAL", "Field 5/19 · target", "▶ target"} {
 		if !strings.Contains(view, expected) {
 			t.Fatalf("editor view missing %q:\n%s", expected, view)
 		}
@@ -713,21 +1399,237 @@ func TestEditorShowsActiveFieldAndCaret(t *testing.T) {
 	}
 }
 
-func TestEditorCyclesAWSProfiles(t *testing.T) {
+func TestEditorSelectsAWSProfiles(t *testing.T) {
 	cfg := &config.Config{Name: "corp", AWSProfile: "default"}
 	model := newTestApp(nil, RunOptions{AWSProfiles: []string{"default", "production"}})
 	model.editor = newConnectionEditor(cfg, model.options.AWSProfiles)
 	model.editor.field = len(model.editor.fields) - 1
 	model.editor.input = model.editor.values[model.editor.field]
-	updated, _ := model.updateEditor("right", nil)
+	updated, _ := model.updateEditor("enter", nil)
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("v", []rune("v"))
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("down", nil)
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("enter", nil)
 	model = updated.(appModel)
 	if model.editor.values[model.editor.field] != "production" {
 		t.Fatalf("selected profile = %q, want production", model.editor.values[model.editor.field])
 	}
-	updated, _ = model.updateEditor("left", nil)
+	updated, _ = model.updateEditor("enter", nil)
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("up", nil)
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("enter", nil)
 	model = updated.(appModel)
 	if model.editor.values[model.editor.field] != "default" {
 		t.Fatalf("selected profile = %q, want default", model.editor.values[model.editor.field])
+	}
+}
+
+func TestVimSaveRefreshBeforeCompletion(t *testing.T) {
+	cfg := &config.Config{Name: "corp", AccountID: "123456789012", Kind: config.ProfileKindVPC, SSHPort: 22}
+	model := newTestApp([]ConnSummary{{Name: cfg.Name, Account: cfg.AccountID}}, RunOptions{SaveConfig: func(string, *config.Config) error { return nil }})
+	model.knownConfigs = []*config.Config{cfg}
+	model.editor = newConnectionEditor(cfg, nil)
+	model.editor.values[4] = "new-target"
+	updated, command := model.saveVimEditor(false)
+	model = updated.(appModel)
+	message := command().(vimSaveFinishedMsg)
+	model.applyRefreshedConfigs([]*config.Config{message.cfg})
+	updated, _ = model.Update(message)
+	model = updated.(appModel)
+	if model.editor.conflicted || model.editor.isDirty() {
+		t.Fatalf("own save was treated as a conflicting external edit: %+v", model.editor)
+	}
+}
+
+func TestEditorEscapeConfirmsUnsavedChanges(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, SSHPort: 22}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	model.editor.values[0] = "changed"
+	model.editor.vimInsert = true
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if model.editor == nil || !model.editor.discardConfirm || !strings.Contains(model.View(), "Discard unsaved changes?") {
+		t.Fatal("escape did not confirm before discarding")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	model = updated.(appModel)
+	if model.editor == nil || model.editor.discardConfirm || model.editor.values[0] != "changed" {
+		t.Fatal("canceling confirmation did not preserve the draft")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	model = updated.(appModel)
+	if model.editor != nil {
+		t.Fatal("confirming discard did not return to the parent")
+	}
+}
+
+func TestEditorEscapeReturnsToParent(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, SSHPort: 22}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	model = updated.(appModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if model.editor == nil || model.editor.yamlMode {
+		t.Fatal("clean YAML editor did not return to the form")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if model.editor != nil {
+		t.Fatal("clean form did not return to the parent")
+	}
+}
+
+func TestEditorEscapeConfirmsNewAndYAMLDrafts(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, SSHPort: 22}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	model.editor.isNew = true
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if !model.editor.discardConfirm {
+		t.Fatal("new connection did not request discard confirmation")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	model = updated.(appModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyCtrlY})
+	model = updated.(appModel)
+	model.editor.yamlLines[0] = "name: changed"
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if !model.editor.discardConfirm {
+		t.Fatal("modified YAML did not request discard confirmation")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	model = updated.(appModel)
+	if model.editor == nil || model.editor.yamlMode || model.editor.values[0] != "corp" {
+		t.Fatal("discarding YAML did not restore the parent form")
+	}
+}
+
+func TestEditorEscapeConfirmsRouteChanges(t *testing.T) {
+	cfg := &config.Config{Name: "corp", SSHPort: 22, Routes: []config.NetworkRoute{{CIDR: "10.0.0.0/16", Selected: true}}}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	model.editor.field = 12
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(appModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeySpace})
+	model = updated.(appModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if !model.editor.discardConfirm || model.editor.routes[0].Selected {
+		t.Fatal("route changes did not request confirmation")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	model = updated.(appModel)
+	if !model.editor.routePicker || model.editor.routes[0].Selected {
+		t.Fatal("canceling discard lost the route draft")
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	model = updated.(appModel)
+	if model.editor.routePicker || !model.editor.routes[0].Selected {
+		t.Fatal("confirming discard did not restore the parent form")
+	}
+}
+
+func TestEditorKeepsHeaderWithoutConnectionsTable(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, SSHPort: 22}
+	for _, size := range [][2]int{{80, 24}, {160, 30}} {
+		model := newTestApp([]ConnSummary{{Name: "corp"}, {Name: "other"}}, RunOptions{})
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		model = updated.(appModel)
+		before := strings.Join(model.chrome().Dashboard, "\n")
+		headerHeight := len(model.chrome().headerRows(model.width, model.height))
+		model.editor = newConnectionEditor(cfg, nil)
+		view := ansiEscapePattern.ReplaceAllString(model.View(), "")
+		if strings.Contains(view, "connections(all)") || !strings.Contains(view, "edit(corp)") {
+			t.Fatalf("size %v: editor view contains connection table or lacks editor:\n%s", size, view)
+		}
+		if got := strings.Join(model.chrome().Dashboard, "\n"); got != before {
+			t.Fatalf("size %v: editor changed dashboard metadata", size)
+		}
+		if got := len(model.chrome().headerRows(model.width, model.height)); got != headerHeight {
+			t.Fatalf("size %v: editor changed header height from %d to %d", size, headerHeight, got)
+		}
+		if lines := strings.Count(view, "\n") + 1; lines > size[1] {
+			t.Fatalf("size %v: view has %d lines", size, lines)
+		}
+	}
+}
+
+func TestEditorViewsFitTerminal(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, SSHPort: 22}
+	for _, size := range [][2]int{{40, 12}, {60, 16}, {80, 18}, {90, 18}, {120, 20}, {160, 30}} {
+		model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{})
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		model = updated.(appModel)
+		model.editor = newConnectionEditor(cfg, nil)
+		for _, yamlMode := range []bool{false, true} {
+			if yamlMode {
+				if err := enterYAMLEditor(model.editor); err != nil {
+					t.Fatal(err)
+				}
+			}
+			view := model.View()
+			if lines := strings.Count(view, "\n") + 1; lines > size[1] {
+				t.Fatalf("size %v YAML %v: view has %d lines", size, yamlMode, lines)
+			}
+			for _, line := range strings.Split(view, "\n") {
+				if cells := lipgloss.Width(line); cells > size[0] {
+					t.Fatalf("size %v YAML %v: %d-cell line: %q", size, yamlMode, cells, line)
+				}
+			}
+		}
+	}
+}
+
+func TestVimKeyboardWorkflow(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, ConnectionMethod: "ssm", SSHPort: 22}
+	var saved *config.Config
+	model := newTestApp(nil, RunOptions{SaveConfig: func(_ string, draft *config.Config) error { saved = draft; return nil }})
+	model.editor = newConnectionEditor(cfg, nil)
+	model.editor.input = model.editor.values[0]
+	press := func(key tea.KeyMsg) tea.Cmd {
+		t.Helper()
+		updated, command := model.Update(key)
+		model = updated.(appModel)
+		return command
+	}
+	press(tea.KeyMsg{Type: tea.KeyCtrlY})
+	model.editor.yamlCol = 6
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("new-")})
+	press(tea.KeyMsg{Type: tea.KeyCtrlO})
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(":")})
+	view := ansiEscapePattern.ReplaceAllString(model.View(), "")
+	if !strings.Contains(view, ":|") || !strings.Contains(view, "yaml ·") {
+		t.Fatalf("editor command prompt missing: %q", view)
+	}
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("wq")})
+	command := press(tea.KeyMsg{Type: tea.KeyEnter})
+	if command == nil {
+		t.Fatal(":wq did not start a save")
+	}
+	updated, _ := model.Update(command())
+	model = updated.(appModel)
+	if saved == nil || saved.Name != "new-corp" || model.editor == nil || model.editor.yamlMode {
+		t.Fatalf("YAML :wq result: saved=%+v editor=%+v", saved, model.editor)
+	}
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(":")})
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	press(tea.KeyMsg{Type: tea.KeyEnter})
+	if model.editor != nil {
+		t.Fatal(":q did not close the unchanged form")
 	}
 }
 
@@ -843,7 +1745,11 @@ func TestEditorChecksSelectedAWSProfileInUI(t *testing.T) {
 	model.editor = newConnectionEditor(cfg, model.options.AWSProfiles)
 	model.editor.field = len(model.editor.fields) - 1
 	model.editor.input = model.editor.values[model.editor.field]
-	updated, _ := model.updateEditor("right", nil)
+	updated, _ := model.updateEditor("enter", nil)
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("down", nil)
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("enter", nil)
 	model = updated.(appModel)
 	updated, command := model.updateEditor("v", nil)
 	model = updated.(appModel)
@@ -1076,6 +1982,387 @@ func TestEscFromConnectionReturnsHome(t *testing.T) {
 	}
 }
 
+func TestEscAtHomeDoesNotQuit(t *testing.T) {
+	model := newTestApp([]ConnSummary{{Name: "corp"}}, RunOptions{})
+	model.outcome = Outcome{View: ViewHome}
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if command != nil || model.outcome.Quit {
+		t.Fatalf("esc at home quit the app: outcome = %+v, cmd = %v", model.outcome, command != nil)
+	}
+	if model.level() != 0 || model.outcome.View != ViewHome {
+		t.Fatalf("esc at home changed the view: %+v", model.outcome)
+	}
+}
+
+func TestNoticeCountsDownAndClears(t *testing.T) {
+	model := newTestApp(nil, RunOptions{})
+	model.setError("boom")
+	if got := model.notice(); got != "5s · boom" {
+		t.Fatalf("notice = %q, want %q", got, "5s · boom")
+	}
+	for remaining := 4; remaining >= 1; remaining-- {
+		updated, command := model.Update(noticeTickMsg{})
+		model = updated.(appModel)
+		if command == nil {
+			t.Fatalf("notice tick did not reschedule itself")
+		}
+		want := fmt.Sprintf("%ds · boom", remaining)
+		if got := model.notice(); got != want {
+			t.Fatalf("notice = %q, want %q", got, want)
+		}
+	}
+	updated, _ := model.Update(noticeTickMsg{})
+	model = updated.(appModel)
+	if model.errorMsg != "" || model.notice() != "" {
+		t.Fatalf("notice did not clear: %q", model.notice())
+	}
+}
+
+func TestNewNoticeRestartsCountdown(t *testing.T) {
+	model := newTestApp(nil, RunOptions{})
+	model.setError("first")
+	updated, _ := model.Update(noticeTickMsg{})
+	model = updated.(appModel)
+	if got := model.notice(); got != "4s · first" {
+		t.Fatalf("notice = %q, want %q", got, "4s · first")
+	}
+	model.setError("second")
+	if got := model.notice(); got != "5s · second" {
+		t.Fatalf("new notice did not restart the countdown: %q", got)
+	}
+}
+
+func TestNoticeAppearsInViewWithCountdown(t *testing.T) {
+	model := newTestApp(nil, RunOptions{})
+	model.setError("boom")
+	if view := model.View(); !strings.Contains(view, "5s · boom") {
+		t.Fatalf("view missing notice countdown:\n%s", view)
+	}
+}
+
+func TestEditorMovesCaretAndEditsInPlace(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, SSHPort: 22}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	model.editor.field = 4 // target (free text)
+	model.editor.values[4] = "abcdef"
+	model.editor.input = "abcdef"
+	model.editor.cursor = editorCursorEnd(model.editor.input)
+
+	apply := func(key string, runes []rune) {
+		t.Helper()
+		updated, _ := model.updateEditor(key, runes)
+		model = updated.(appModel)
+	}
+
+	apply("left", nil)
+	apply("left", nil)
+	if model.editor.cursor != 4 {
+		t.Fatalf("caret = %d, want 4", model.editor.cursor)
+	}
+	apply("i", []rune("i"))
+	apply("", []rune("X"))
+	if got := model.editor.values[4]; got != "abcdXef" {
+		t.Fatalf("typed in place = %q, want %q", got, "abcdXef")
+	}
+	if model.editor.cursor != 5 {
+		t.Fatalf("caret after typing = %d, want 5", model.editor.cursor)
+	}
+
+	apply("backspace", nil)
+	if got := model.editor.values[4]; got != "abcdef" {
+		t.Fatalf("backspace = %q, want %q", got, "abcdef")
+	}
+
+	apply("home", nil)
+	apply("delete", nil)
+	if got := model.editor.values[4]; got != "bcdef" {
+		t.Fatalf("delete at home = %q, want %q", got, "bcdef")
+	}
+
+	apply("end", nil)
+	apply("left", nil)
+	apply("", []rune("Z"))
+	if got := model.editor.values[4]; got != "bcdeZf" {
+		t.Fatalf("insert before last rune = %q, want %q", got, "bcdeZf")
+	}
+}
+
+func TestEditorCaretIsRuneBased(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, SSHPort: 22}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	model.editor.field = 4
+	model.editor.values[4] = "héllo"
+	model.editor.input = "héllo"
+	model.editor.cursor = editorCursorEnd(model.editor.input)
+
+	updated, _ := model.updateEditor("left", nil)
+	model = updated.(appModel)
+	if model.editor.cursor != 4 {
+		t.Fatalf("caret = %d, want 4 runes", model.editor.cursor)
+	}
+	updated, _ = model.updateEditor("i", []rune("i"))
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("", []rune("!"))
+	model = updated.(appModel)
+	if got := model.editor.values[4]; got != "héll!o" {
+		t.Fatalf("typed in place = %q, want %q", got, "héll!o")
+	}
+}
+
+func TestEditorRendersCaretAtCursor(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, SSHPort: 22}
+	editor := newConnectionEditor(cfg, nil)
+	editor.field = 4
+	editor.values[4] = "abcdef"
+	editor.input = "abcdef"
+	editor.cursor = 2
+	view := renderEditor(editor, 8, "")
+	if !strings.Contains(ansiEscapePattern.ReplaceAllString(view, ""), "abcdef") || strings.Contains(view, "ab|cdef") {
+		t.Fatalf("caret was not drawn at the cursor:\n%s", view)
+	}
+}
+
+func TestEditorSplitShowsYAMLPreview(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, ConnectionMethod: "ssm", Region: "eu-central-1", Target: "i-1", SSHPort: 22}
+	editor := newConnectionEditor(cfg, nil)
+	view := ansiEscapePattern.ReplaceAllString(renderEditorSplit(editor, 40, 140, ""), "")
+	for _, expected := range []string{"YAML PREVIEW", "name: corp", "connection_method: ssm", "│"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("split editor missing %q:\n%s", expected, view)
+		}
+	}
+}
+
+func TestEditorSplitShowsValidationError(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, ConnectionMethod: "ssm", SSHPort: 22}
+	editor := newConnectionEditor(cfg, nil)
+	editor.values[7] = "not-a-port"
+	view := renderEditorSplit(editor, 40, 140, "")
+	if !strings.Contains(view, "invalid SSH port") {
+		t.Fatalf("split editor did not surface the draft error:\n%s", view)
+	}
+}
+
+func TestYAMLEditorAppliesEdits(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, ConnectionMethod: "ssm", Region: "eu-central-1", Target: "i-1", SSHPort: 22}
+	model := newTestApp(nil, RunOptions{SaveConfig: func(string, *config.Config) error { return nil }})
+	model.editor = newConnectionEditor(cfg, nil)
+
+	updated, _ := model.updateEditor("ctrl+y", nil)
+	model = updated.(appModel)
+	if !model.editor.yamlMode {
+		t.Fatal("ctrl+y did not open the YAML editor")
+	}
+	replaced := false
+	for index, line := range model.editor.yamlLines {
+		if line == "name: corp" {
+			model.editor.yamlLines[index] = "name: renamed"
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		t.Fatalf("YAML draft has no name line: %v", model.editor.yamlLines)
+	}
+
+	updated, command := model.updateEditor("ctrl+s", nil)
+	model = updated.(appModel)
+	updated, _ = model.Update(command())
+	model = updated.(appModel)
+	if !model.editor.yamlMode {
+		t.Fatal("ctrl+s closed the YAML editor")
+	}
+	if got := model.editor.values[0]; got != "renamed" {
+		t.Fatalf("name = %q, want renamed", got)
+	}
+}
+
+func TestYAMLEditorCancelDiscardsEdits(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, ConnectionMethod: "ssm", SSHPort: 22}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	updated, _ := model.updateEditor("ctrl+y", nil)
+	model = updated.(appModel)
+	model.editor.yamlLines[0] = "name: discarded"
+
+	model.editor.vimPrompt, model.editor.vimInput = ":", "q!"
+	updated, _ = model.updateVimPrompt("enter", nil)
+	model = updated.(appModel)
+	if model.editor.yamlMode {
+		t.Fatal("esc did not leave the YAML editor")
+	}
+	if got := model.editor.values[0]; got != "corp" {
+		t.Fatalf("esc applied YAML edits: name = %q", got)
+	}
+}
+
+func TestYAMLEditorMultiLineEditing(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, ConnectionMethod: "ssm", SSHPort: 22}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	updated, _ := model.updateEditor("ctrl+y", nil)
+	model = updated.(appModel)
+	original := len(model.editor.yamlLines)
+
+	updated, _ = model.updateEditor("i", []rune("i"))
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("", []rune("# "))
+	model = updated.(appModel)
+	if got := model.editor.yamlLines[0]; got != "# name: corp" {
+		t.Fatalf("typing at start = %q", got)
+	}
+	updated, _ = model.updateEditor("end", nil)
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("enter", nil)
+	model = updated.(appModel)
+	if len(model.editor.yamlLines) != original+1 || model.editor.yamlRow != 1 {
+		t.Fatalf("enter did not split the line: rows=%d row=%d", len(model.editor.yamlLines), model.editor.yamlRow)
+	}
+	updated, _ = model.updateEditor("backspace", nil)
+	model = updated.(appModel)
+	if len(model.editor.yamlLines) != original || model.editor.yamlRow != 0 {
+		t.Fatalf("backspace did not merge the line: rows=%d row=%d", len(model.editor.yamlLines), model.editor.yamlRow)
+	}
+}
+
+func TestVimEditorModesAndUndo(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, ConnectionMethod: "ssm", SSHPort: 22}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	model.editor.input = model.editor.values[0]
+	updated, _ := model.updateEditor("i", []rune("i"))
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("x", []rune("x"))
+	model = updated.(appModel)
+	if model.editor.values[0] != "xcorp" {
+		t.Fatalf("insert mode: %q", model.editor.values[0])
+	}
+	updated, _ = model.updateEditor("esc", nil)
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("u", []rune("u"))
+	model = updated.(appModel)
+	if model.editor.values[0] != "corp" || model.editor.vimInsert {
+		t.Fatalf("undo/mode: %+v", model.editor)
+	}
+	updated, _ = model.updateEditor("ctrl+y", nil)
+	model = updated.(appModel)
+	updated, _ = model.updateEditor("o", []rune("o"))
+	model = updated.(appModel)
+	if !model.editor.vimInsert || model.editor.yamlRow != 1 {
+		t.Fatalf("open line: %+v", model.editor)
+	}
+}
+
+func TestVimSavePreservesDraftOnFailure(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, ConnectionMethod: "ssm", SSHPort: 22}
+	model := newTestApp(nil, RunOptions{SaveConfig: func(string, *config.Config) error { return errors.New("disk full") }})
+	model.editor = newConnectionEditor(cfg, nil)
+	updated, _ := model.updateEditor("ctrl+y", nil)
+	model = updated.(appModel)
+	model.editor.yamlLines[0] = "name: renamed"
+	updated, command := model.saveVimEditor(false)
+	model = updated.(appModel)
+	if command == nil || !model.editor.vimSaving {
+		t.Fatal("save did not start")
+	}
+	updated, _ = model.Update(command())
+	model = updated.(appModel)
+	if model.editor == nil || !model.editor.yamlMode || model.editor.yamlLines[0] != "name: renamed" || !strings.Contains(model.errorMsg, "disk full") {
+		t.Fatalf("failed save lost draft: editor=%+v error=%q", model.editor, model.errorMsg)
+	}
+	model.editor.vimPrompt, model.editor.vimInput = ":", "q"
+	updated, _ = model.updateVimPrompt("enter", nil)
+	model = updated.(appModel)
+	if !model.editor.yamlMode || !strings.Contains(model.errorMsg, "unsaved") {
+		t.Fatal(":q did not protect unsaved changes")
+	}
+	model.editor.vimPrompt, model.editor.vimInput = ":", "q!"
+	updated, _ = model.updateVimPrompt("enter", nil)
+	model = updated.(appModel)
+	if model.editor.yamlMode || model.editor.values[0] != "corp" {
+		t.Fatal(":q! did not discard YAML draft")
+	}
+}
+
+func TestVimSaveKeepsYAMLOpen(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, ConnectionMethod: "ssm", SSHPort: 22}
+	var saved *config.Config
+	model := newTestApp(nil, RunOptions{SaveConfig: func(_ string, draft *config.Config) error { saved = draft; return nil }})
+	model.editor = newConnectionEditor(cfg, nil)
+	updated, _ := model.updateEditor("ctrl+y", nil)
+	model = updated.(appModel)
+	model.editor.yamlLines[0] = "name: renamed"
+	updated, command := model.saveVimEditor(false)
+	model = updated.(appModel)
+	updated, _ = model.Update(command())
+	model = updated.(appModel)
+	if saved == nil || saved.Name != "renamed" || !model.editor.yamlMode || model.editor.isDirty() || model.editor.originalName != "renamed" {
+		t.Fatalf("save result: saved=%+v editor=%+v", saved, model.editor)
+	}
+}
+
+func TestVimNormalModeDoesNotInsertLines(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, SSHPort: 22}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	updated, _ := model.updateEditor("ctrl+y", nil)
+	model = updated.(appModel)
+	before := strings.Join(model.editor.yamlLines, "\n")
+	updated, _ = model.updateEditor("enter", nil)
+	model = updated.(appModel)
+	model.editor.yamlCol = len([]rune(model.editor.yamlLines[0]))
+	updated, _ = model.updateEditor("x", []rune("x"))
+	model = updated.(appModel)
+	if got := strings.Join(model.editor.yamlLines, "\n"); got != before {
+		t.Fatalf("normal mode unexpectedly changed YAML: %q", got)
+	}
+}
+
+func TestVimLinePreservesTextAndCursorVisibility(t *testing.T) {
+	for _, line := range []string{"name: \"a:#b\" # comment", "number: 42", "enabled: true", "路径: hello"} {
+		got := ansiEscapePattern.ReplaceAllString(renderVimLine(line, 2, false, true, 0), "")
+		if got != line {
+			t.Fatalf("YAML rendering changed text: got %q, want %q", got, line)
+		}
+	}
+	line := "prefix-界界-tail"
+	rendered := renderVimLine(line, len([]rune(line))-1, false, false, 6)
+	if lipgloss.Width(rendered) > 6 || !strings.Contains(ansiEscapePattern.ReplaceAllString(rendered, ""), "l") {
+		t.Fatalf("cursor clipped: %q", rendered)
+	}
+}
+
+func TestVimSearchUsesRuneOffsets(t *testing.T) {
+	editor := &connectionEditor{yamlLines: []string{"İ value target"}}
+	editor.searchYAML("target")
+	if editor.yamlCol != 8 {
+		t.Fatalf("search cursor = %d, want 8", editor.yamlCol)
+	}
+}
+
+func TestYAMLEditorOwnsSlashKey(t *testing.T) {
+	cfg := &config.Config{Name: "corp", Kind: config.ProfileKindVPC, ConnectionMethod: "ssm", SSHPort: 22}
+	model := newTestApp(nil, RunOptions{})
+	model.editor = newConnectionEditor(cfg, nil)
+	updated, _ := model.updateEditor("ctrl+y", nil)
+	model = updated.(appModel)
+	model.editor.yamlRow, model.editor.yamlCol = 0, 0
+	updated, _ = model.updateEditor("i", []rune("i"))
+	model = updated.(appModel)
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	model = updated.(appModel)
+	if model.searching {
+		t.Fatal("/ opened search instead of editing YAML")
+	}
+	if !strings.HasPrefix(model.editor.yamlLines[0], "/") {
+		t.Fatalf("slash was not inserted: %q", model.editor.yamlLines[0])
+	}
+}
+
 func TestDetailCardShowsTunnelTargetDNSRoutes(t *testing.T) {
 	detail := &ConnDetail{
 		Name: "dns-split", Kind: "vpc", Method: "ssm", Region: "eu-central-1", AWSProfile: "bastionctl-test-profile-one", SSHPort: 22,
@@ -1109,7 +2396,7 @@ func TestDetailCardRespectsBudget(t *testing.T) {
 	}
 }
 
-func TestConnectionFooterIsAtTerminalBottom(t *testing.T) {
+func TestConnectionPanelFillsTerminalHeight(t *testing.T) {
 	detail := &ConnDetail{Name: "corp", Method: "ssh", Target: "i-1", TargetOK: true}
 	model := appModel{options: RunOptions{Level: 1, Detail: detail}, home: newHomeTable(nil, 0)}
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
@@ -1117,8 +2404,21 @@ func TestConnectionFooterIsAtTerminalBottom(t *testing.T) {
 	if lines := strings.Count(view, "\n") + 1; lines != 20 {
 		t.Fatalf("connection view has %d lines, want terminal height 20:\n%s", lines, view)
 	}
-	if !strings.Contains(strings.Split(view, "\n")[19], "esc") {
-		t.Fatalf("footer is not on final terminal row:\n%s", view)
+	rows := strings.Split(view, "\n")
+	if !strings.Contains(rows[0], "BASTIONCTL") {
+		t.Fatalf("top bar missing on the first row:\n%s", view)
+	}
+	if !strings.Contains(view, "connection(corp)") {
+		t.Fatalf("panel title missing on the first body row:\n%s", view)
+	}
+	if !strings.Contains(rows[18], "└") {
+		t.Fatalf("panel does not close above the footer:\n%s", view)
+	}
+	if !strings.Contains(rows[19], project.Repository) {
+		t.Fatalf("project footer missing:\n%s", view)
+	}
+	if !strings.Contains(rows[0], "<esc>") {
+		t.Fatalf("header hint bar missing:\n%s", view)
 	}
 }
 
@@ -1238,6 +2538,8 @@ func TestNewConnectionWizardStaysInsideUI(t *testing.T) {
 	if model.editor == nil || !model.editor.isNew || model.editor.values[10] != "i-new" {
 		t.Fatalf("new connection editor missing: %+v", model.editor)
 	}
+	updated, _ = model.updateEditor("i", []rune("i"))
+	model = updated.(appModel)
 	updated, _ = model.updateEditor("corp-new", runesOf("corp-new"))
 	model = updated.(appModel)
 	updated, command = model.updateEditor("ctrl+s", nil)
@@ -1251,5 +2553,396 @@ func TestNewConnectionWizardStaysInsideUI(t *testing.T) {
 	model = updated.(appModel)
 	if model.options.Detail == nil || model.options.Detail.Target != "i-new" || model.outcome.Action != "" {
 		t.Fatalf("new connection detail not opened in-app: detail=%+v outcome=%+v", model.options.Detail, model.outcome)
+	}
+}
+
+func dashboardTestModel() appModel {
+	summaries := []ConnSummary{
+		{Name: "corp", Account: "698715940080", Kind: "vpc", Method: "ssm", Region: "eu-west-1", Networks: "172.16.0.0/12", DNS: "split (2 domains)", Running: true, PID: 4242},
+		{Name: "ci-edge", Account: "698715940080", Kind: "dedicated", Method: "ssh", Region: "us-east-1", DNS: "off"},
+	}
+	return newTestApp(summaries, RunOptions{
+		Account:       "698715940080 (prod)",
+		AccountLabels: map[string]string{"698715940080": "698715940080 (prod)"},
+		Profile:       "staging",
+		Highlight:     0,
+		Version:       "v1.2.3",
+	})
+}
+
+func TestDashboardRendersAboveTable(t *testing.T) {
+	model := dashboardTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	model = updated.(appModel)
+	view := ansiEscapePattern.ReplaceAllString(model.View(), "")
+	for _, expected := range []string{
+		"BASTIONCTL", "698715940080 (prod)",
+		"Profile", "staging",
+		"Connections", "2 saved · 1 running",
+		"Selected", "corp",
+		"Method", "ssm · eu-west-1",
+		"DNS", "split (2 domains)",
+		"Bastionctl", "v1.2.3",
+		"<enter>", "open",
+		"<v>", "check AWS",
+		"<q>", "quit",
+		"connections(all)[2]",
+		"┌", "└", "│",
+	} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("dashboard view missing %q:\n%s", expected, view)
+		}
+	}
+}
+
+func TestDashboardPersistsAcrossKeys(t *testing.T) {
+	model := dashboardTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	model = updated.(appModel)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(appModel)
+	view := ansiEscapePattern.ReplaceAllString(model.View(), "")
+	if !strings.Contains(view, "Profile") || !strings.Contains(view, "connections(all)[2]") {
+		t.Fatalf("dashboard disappeared after a key:\n%s", view)
+	}
+}
+
+func TestDashboardHiddenOnNarrowTerminal(t *testing.T) {
+	model := dashboardTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 50, Height: 24})
+	model = updated.(appModel)
+	view := ansiEscapePattern.ReplaceAllString(model.View(), "")
+	if strings.Contains(view, "Selected") {
+		t.Fatalf("narrow terminal still rendered the dashboard metadata:\n%s", view)
+	}
+	if !strings.Contains(view, "BASTIONCTL") {
+		t.Fatalf("narrow terminal lost the top bar:\n%s", view)
+	}
+}
+
+func TestDashboardStaysInConnectionView(t *testing.T) {
+	model := dashboardTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	model = updated.(appModel)
+	before := strings.Join(model.chrome().Dashboard, "\n")
+	headerHeight := len(model.chrome().headerRows(model.width, model.height))
+	model.options.Level = 1
+	model.options.Detail = &ConnDetail{Name: "corp", Kind: "vpc", Method: "ssm", Region: "eu-west-1", Target: "i-1", TargetOK: true}
+	view := ansiEscapePattern.ReplaceAllString(model.View(), "")
+	if got := strings.Join(model.chrome().Dashboard, "\n"); got != before {
+		t.Fatalf("connection view changed dashboard metadata: %q, want %q", got, before)
+	}
+	if got := len(model.chrome().headerRows(model.width, model.height)); got != headerHeight {
+		t.Fatalf("header height changed from %d to %d", headerHeight, got)
+	}
+	if strings.Contains(view, "connections(all)") || !strings.Contains(view, "connection(corp)") {
+		t.Fatalf("connection view contains list or lacks details:\n%s", view)
+	}
+	if !strings.Contains(view, "BASTIONCTL") {
+		t.Fatalf("connection view lost the top bar:\n%s", view)
+	}
+}
+
+func TestDashboardStaysAcrossViews(t *testing.T) {
+	for _, size := range [][2]int{{60, 16}, {80, 24}, {160, 30}} {
+		model := dashboardTestModel()
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		model = updated.(appModel)
+		before := strings.Join(model.chrome().Dashboard, "\n")
+		height := len(model.chrome().headerRows(model.width, model.height))
+		if before == "" {
+			t.Fatalf("size %v: initial dashboard missing", size)
+		}
+		views := []struct {
+			name  string
+			apply func(*appModel)
+		}{
+			{"connection", func(m *appModel) { m.options.Level = 1; m.options.Detail = &ConnDetail{Name: "corp"} }},
+			{"editor", func(m *appModel) { m.editor = newConnectionEditor(&config.Config{Name: "corp", SSHPort: 22}, nil) }},
+			{"rescan", func(m *appModel) { m.rescan = &rescanSelector{connection: "corp"} }},
+			{"wizard", func(m *appModel) { m.newWizard = &newConnectionWizard{step: "kind"} }},
+			{"logs", func(m *appModel) { m.logSession = &LogSession{} }},
+			{"help", func(m *appModel) { m.help = true }},
+		}
+		for _, view := range views {
+			current := model
+			view.apply(&current)
+			if got := strings.Join(current.chrome().Dashboard, "\n"); got != before {
+				t.Fatalf("size %v %s: dashboard changed: %q, want %q", size, view.name, got, before)
+			}
+			if got := len(current.chrome().headerRows(current.width, current.height)); got != height {
+				t.Fatalf("size %v %s: header height changed from %d to %d", size, view.name, height, got)
+			}
+		}
+	}
+}
+
+func TestConnectionTransitionKeepsHeaderStable(t *testing.T) {
+	for _, size := range [][2]int{{40, 12}, {60, 16}, {80, 18}, {90, 24}, {100, 24}, {120, 30}, {160, 30}} {
+		model := dashboardTestModel()
+		model.options.LoadDetail = func(name string) (*ConnDetail, error) {
+			return &ConnDetail{Name: name, Method: "ssm", Region: "eu-west-1", TargetOK: true}, nil
+		}
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		model = updated.(appModel)
+		before := strings.Join(model.chrome().Dashboard, "\n")
+		height := len(model.chrome().headerRows(model.width, model.height))
+		updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		model = updated.(appModel)
+		if got := len(model.chrome().headerRows(model.width, model.height)); got != height {
+			t.Fatalf("size %v: loading changed header height from %d to %d", size, height, got)
+		}
+		if !strings.Contains(model.View(), "loading corp") {
+			t.Fatalf("size %v: loading indicator missing", size)
+		}
+		if command == nil {
+			t.Fatal("opening connection did not load details")
+		}
+		updated, _ = model.Update(command())
+		model = updated.(appModel)
+		if got := strings.Join(model.chrome().Dashboard, "\n"); got != before {
+			t.Fatalf("size %v: connection changed dashboard: %q, want %q", size, got, before)
+		}
+		if got := len(model.chrome().headerRows(model.width, model.height)); got != height {
+			t.Fatalf("size %v: connection changed header height from %d to %d", size, height, got)
+		}
+		view := ansiEscapePattern.ReplaceAllString(model.View(), "")
+		if strings.Contains(view, "connections(all)") || !strings.Contains(view, "connection(corp)") {
+			t.Fatalf("size %v: detail view contains list or lacks details:\n%s", size, view)
+		}
+		if lines := strings.Count(view, "\n") + 1; lines > size[1] {
+			t.Fatalf("size %v: connection view has %d lines", size, lines)
+		}
+		updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		model = updated.(appModel)
+		if model.level() != 0 || len(model.chrome().headerRows(model.width, model.height)) != height {
+			t.Fatalf("size %v: returning home changed header or level", size)
+		}
+	}
+}
+
+func TestShowEditAndBackKeepHeader(t *testing.T) {
+	model := dashboardTestModel()
+	model.options.LoadDetail = func(name string) (*ConnDetail, error) {
+		return &ConnDetail{Name: name, TargetOK: true}, nil
+	}
+	model.options.LoadConfig = func(name string) (*config.Config, error) {
+		return &config.Config{Name: name, SSHPort: 22}, nil
+	}
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	model = updated.(appModel)
+	before := strings.Join(model.chrome().Dashboard, "\n")
+	height := len(model.chrome().headerRows(model.width, model.height))
+	check := func(title string) {
+		t.Helper()
+		if got := strings.Join(model.chrome().Dashboard, "\n"); got != before {
+			t.Fatalf("%s changed dashboard", title)
+		}
+		if got := len(model.chrome().headerRows(model.width, model.height)); got != height {
+			t.Fatalf("%s changed header height from %d to %d", title, height, got)
+		}
+		view := model.View()
+		if !strings.Contains(view, title) || strings.Contains(view, "connections(all)") {
+			t.Fatalf("%s did not use a single panel:\n%s", title, view)
+		}
+	}
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(appModel)
+	updated, _ = model.Update(command())
+	model = updated.(appModel)
+	check("connection(corp)")
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	model = updated.(appModel)
+	if command == nil {
+		t.Fatal("edit did not load configuration")
+	}
+	updated, _ = model.Update(command())
+	model = updated.(appModel)
+	check("edit(corp)")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	check("connection(corp)")
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(appModel)
+	if model.level() != 0 || strings.Join(model.chrome().Dashboard, "\n") != before || len(model.chrome().headerRows(model.width, model.height)) != height {
+		t.Fatal("returning home changed the dashboard")
+	}
+}
+
+func TestLogViewKeepsHeaderAndShowsNotifications(t *testing.T) {
+	model := dashboardTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	model = updated.(appModel)
+	before := strings.Join(model.chrome().Dashboard, "\n")
+	model.logSession = &LogSession{}
+	model.logTitle = "Live sshuttle logs"
+	model.logLines = []string{"log entry"}
+	model.actionModal = &actionModal{title: "Action failed", body: "status unavailable", failed: true}
+	view := model.View()
+	if got := strings.Join(model.chrome().Dashboard, "\n"); got != before {
+		t.Fatal("log notification changed the dashboard")
+	}
+	for _, text := range []string{"Live sshuttle logs", "Action failed", "status unavailable"} {
+		if !strings.Contains(view, text) {
+			t.Fatalf("log view missing %q:\n%s", text, view)
+		}
+	}
+}
+
+func TestConnectionDashboardKeepsSelectedAccount(t *testing.T) {
+	summaries := []ConnSummary{
+		{Name: "shared", Account: "123456789012"},
+		{Name: "shared", Account: "014498740021"},
+	}
+	model := newTestApp(summaries, RunOptions{
+		Highlight: 1,
+		AccountLabels: map[string]string{
+			"123456789012": "123456789012 (prod)",
+			"014498740021": "014498740021 (staging)",
+		},
+	})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 160, Height: 30})
+	model = updated.(appModel)
+	model.options.Level = 1
+	model.options.Detail = &ConnDetail{Name: "shared"}
+	view := ansiEscapePattern.ReplaceAllString(model.View(), "")
+	if !strings.Contains(view, "014498740021 (staging)") || strings.Contains(view, "123456789012 (prod)") {
+		t.Fatalf("connection dashboard does not show the selected account:\n%s", view)
+	}
+}
+
+func TestDashboardLayoutsFitWidths(t *testing.T) {
+	model := dashboardTestModel()
+	model.options.AccountLabels["698715940080"] = strings.Repeat("界", 100)
+	for _, width := range []int{200, 160, 130, 120, 100, 90} {
+		rows := renderDashboardLines(model, width)
+		plain := ansiEscapePattern.ReplaceAllString(strings.Join(rows, "\n"), "")
+		if len(rows) == 0 || !strings.Contains(plain, "Profile") {
+			t.Fatalf("dashboard at width %d lost the metadata", width)
+		}
+		for _, row := range rows {
+			plainRow := ansiEscapePattern.ReplaceAllString(row, "")
+			if got := lipgloss.Width(plainRow); got > width {
+				t.Fatalf("dashboard row at width %d is %d cells wide: %q", width, got, plainRow)
+			}
+		}
+	}
+}
+
+func TestAppViewsFitTerminal(t *testing.T) {
+	for _, size := range [][2]int{{40, 12}, {80, 18}, {90, 18}, {90, 20}, {100, 24}, {120, 18}, {120, 20}, {160, 30}} {
+		model := dashboardTestModel()
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		model = updated.(appModel)
+		for _, key := range []string{"", "/", "esc", ":"} {
+			if key != "" {
+				message := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
+				if key == "esc" {
+					message = tea.KeyMsg{Type: tea.KeyEsc}
+				}
+				updated, _ = model.Update(message)
+				model = updated.(appModel)
+			}
+			rows := strings.Split(model.View(), "\n")
+			if len(rows) > size[1] {
+				t.Fatalf("size %v key %q: %d rows", size, key, len(rows))
+			}
+			for _, row := range rows {
+				if cells := lipgloss.Width(row); cells > size[0] {
+					t.Fatalf("size %v key %q: %d-cell row: %q", size, key, cells, row)
+				}
+			}
+		}
+	}
+}
+
+func TestTablePanelTitleAndBorder(t *testing.T) {
+	panel := ansiEscapePattern.ReplaceAllString(renderTablePanel("HEADER\nrow", 40, 4, "connections(all)[2]"), "")
+	top := strings.Split(panel, "\n")[0]
+	before, after, ok := strings.Cut(top, "connections(all)[2]")
+	if !ok || max(lipgloss.Width(before), lipgloss.Width(after))-min(lipgloss.Width(before), lipgloss.Width(after)) > 1 {
+		t.Fatalf("panel title is not centered: %q", top)
+	}
+	for _, expected := range []string{"connections(all)[2]", "┌", "└", "│", "HEADER", "row"} {
+		if !strings.Contains(panel, expected) {
+			t.Fatalf("table panel missing %q:\n%s", expected, panel)
+		}
+	}
+	for _, line := range strings.Split(panel, "\n") {
+		if got := len([]rune(line)); got != 40 {
+			t.Fatalf("panel line is %d cells, want 40: %q", got, line)
+		}
+	}
+	for _, line := range strings.Split(renderPanel("x", 4, 1, "title"), "\n") {
+		if got := lipgloss.Width(line); got != 4 {
+			t.Fatalf("narrow panel line is %d cells, want 4: %q", got, line)
+		}
+	}
+}
+
+func TestHomeTableKeepsNetworksVisible(t *testing.T) {
+	columns, rows := homeLayout(mockSummaries(), 118)
+	foundNetworks := false
+	for _, column := range columns {
+		foundNetworks = foundNetworks || column.Title == "Networks"
+	}
+	if !foundNetworks {
+		t.Fatalf("network column missing: %+v", columns)
+	}
+	if rows[2][0] != "◐ DNS missing" {
+		t.Fatalf("stale status = %q", rows[2][0])
+	}
+}
+
+func TestTopBarKeepsLongAccountLabels(t *testing.T) {
+	account := "123456789012 (prod) · 014498740021 (staging) · demo"
+	model := newTestApp([]ConnSummary{{Name: "corp", Account: account}}, RunOptions{
+		Account: account,
+		Profile: "default",
+		Version: "v1.2.3",
+	})
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 160, Height: 30})
+	view := ansiEscapePattern.ReplaceAllString(updated.(appModel).View(), "")
+	if !strings.Contains(view, account) {
+		t.Fatalf("top bar truncated the account label:\n%s", view)
+	}
+}
+
+func TestTopBarAndHintsAreAlwaysOn(t *testing.T) {
+	model := dashboardTestModel()
+	for _, size := range [][2]int{{200, 30}, {160, 24}, {90, 20}} {
+		updated, _ := model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		view := ansiEscapePattern.ReplaceAllString(updated.(appModel).View(), "")
+		rows := strings.Split(view, "\n")
+		if !strings.Contains(rows[0], "BASTIONCTL") {
+			t.Fatalf("size %v: top bar missing:\n%s", size, view)
+		}
+		if !strings.Contains(view, "<enter>") {
+			t.Fatalf("size %v: header hint bar missing:\n%s", size, view)
+		}
+	}
+}
+
+func TestNoticeRendersAsBorderedPanel(t *testing.T) {
+	model := newTestApp(nil, RunOptions{})
+	model.setError("boom")
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 24})
+	view := ansiEscapePattern.ReplaceAllString(updated.(appModel).View(), "")
+	for _, expected := range []string{"notice", "5s · boom", "┌", "└"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("notice panel missing %q:\n%s", expected, view)
+		}
+	}
+}
+
+func TestOverlayCenterPreservesBackgroundSides(t *testing.T) {
+	border := "│" + strings.Repeat(" ", 38) + "│"
+	base := strings.Join([]string{border, border, border, border, border}, "\n")
+	panel := "┌──┐\n│hi│\n└──┘"
+	view := ansiEscapePattern.ReplaceAllString(overlayCenter(base, panel, 40), "")
+	for _, line := range strings.Split(view, "\n") {
+		if !strings.HasPrefix(line, "│") || !strings.HasSuffix(line, "│") {
+			t.Fatalf("overlay erased the background border: %q", line)
+		}
 	}
 }

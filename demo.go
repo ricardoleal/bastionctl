@@ -92,8 +92,6 @@ func demoConnections() []*demoConn {
 	}
 }
 
-const demoAccountLabel = "123456789012 (prod) · 014498740021 (staging) · demo"
-
 var demoRegions = []string{"eu-central-1", "eu-west-1", "us-east-1", "us-west-2"}
 
 // runDemoApp runs the browser against the mock state until the user quits.
@@ -135,7 +133,11 @@ func runDemoApp() {
 		}
 
 		outcome, err := ui.RunApp(ui.RunOptions{
-			Account:   demoAccountLabel,
+			Account: "demo",
+			AccountLabels: map[string]string{
+				"123456789012": "123456789012 (prod)",
+				"014498740021": "014498740021 (staging)",
+			},
 			Error:     pendingError,
 			Level:     level,
 			Highlight: highlight,
@@ -244,6 +246,7 @@ func runDemoApp() {
 				conns = append(conns, conn)
 				return nil
 			},
+			Version: buildVersion(),
 		})
 		pendingError = ""
 		if err != nil {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/charmbracelet/x/ansi"
 	"golang.org/x/term"
 
 	"bastionctl/internal/probe"
@@ -22,16 +23,19 @@ const (
 	minNameWidth = 12 // never shrink the Name column below this, even on tiny terminals
 )
 
-// truncate shortens s to at most width characters, appending an ellipsis
-// if it had to cut anything.
+// truncate shortens s to at most width display cells, appending an ellipsis
+// if it had to cut anything. It is ANSI-aware, so styled strings are measured
+// by their visible text and their escape sequences (including the final reset)
+// are preserved.
 func truncate(s string, width int) string {
-	if width <= 0 || len(s) <= width {
+	if width <= 0 || ansi.StringWidth(s) <= width {
 		return s
 	}
-	if width <= 1 {
-		return s[:width]
+	if width == 1 {
+		// No room for the ellipsis; keep the first cell only.
+		return ansi.Truncate(s, width, "")
 	}
-	return s[:width-1] + "\u2026"
+	return ansi.Truncate(s, width, "\u2026")
 }
 
 // terminalWidth returns the current terminal column count and whether
@@ -50,12 +54,13 @@ func terminalWidth() (int, bool) {
 	return w, true
 }
 
-// colWidth returns the widest cell in a column, including its header.
+// colWidth returns the widest cell in a column, including its header. Widths
+// are display cells, so ANSI-styled or wide-character cells measure correctly.
 func colWidth(header string, values []string) int {
-	w := len(header)
+	w := ansi.StringWidth(header)
 	for _, v := range values {
-		if len(v) > w {
-			w = len(v)
+		if width := ansi.StringWidth(v); width > w {
+			w = width
 		}
 	}
 	return w

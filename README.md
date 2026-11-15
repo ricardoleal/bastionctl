@@ -159,6 +159,7 @@ GOOS=linux   GOARCH=arm64 go build -o bin/bastionctl-linux-arm64   .
 ./bastionctl --stop corp              # stop a background tunnel
 ./bastionctl --status corp            # show tunnel status
 ./bastionctl --logs                   # follow daemon logs live
+./bastionctl --version                # print the build version and project URL
 ./bastionctl --demo                   # k9s-style browser on simulated data
                                       # (no AWS, no writes; see "Demo mode"; hidden)
 
@@ -171,36 +172,65 @@ GOOS=linux   GOARCH=arm64 go build -o bin/bastionctl-linux-arm64   .
 
 ### Interactive k9s-style browser
 
-In a terminal, a bare run opens a full-screen connection browser (k9s
-style) with a persistent information header and a key-hint footer. Two
-levels:
+In a terminal, a bare run opens a full-screen connection browser with a
+k9s-style header and bordered panels. Two levels:
 
 ```
- bastionctl · connections · 123456789012 (example)             2 connections · 1 running
-──────────────────────────────────────────────────────────────────────────────────
-  Status                    Connection   Account       Kind   Method  …  Networks
- >● Running                 dns-split    123456789012  vpc    ssm        10.0.0.0/16
-  ○ Idle                    corp         123456789012  vpc    ssh        172.16.0.0/12
-──────────────────────────────────────────────────────────────────────────────────
- enter open  n new  s start  x stop  l logs  i status  d dns  r rescan  f forget  : cmd  q quit
+ Profile      default                         <enter> open   <i> status    <f> forget        BASTIONCTL
+ Connections  2 saved · 1 running             <n> new        <d> dns       <:> cmd       ╔═╗ ╔═╗ ╔═╗ ╔═╗
+ Account      123456789012 (prod)             <s> start      <e> edit      <?> help      ║ ╚═╝ ╚═╝ ╚═╝ ║
+ Selected     dns-split                       <x> stop       <v> check AWS  <q> quit     ║    ╔═══╗    ║
+ Method       ssm · eu-west-1                 <a> launch     </> search                  ║    ║ ╬ ║    ║
+ DNS          split (1 domain)                <l> logs       <r> rescan                  ╚════╣ ║ ╠════╝
+ Bastionctl   v0.2.0                                                                          ╚═╩═╝
+┌───────────────────────────────────── connections(all)[2] ───────────────────────────────────────────┐
+│ Status      Connection  Region     AWS Profile  DNS               Networks        Account          │
+│ ● Running   dns-split   eu-west-1  default      split (1 domain)  10.0.0.0/16     123456789012     │
+│ ○ Idle      corp        eu-west-1  default      off               172.16.0.0/12   123456789012     │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                 ricardoleal/bastionctl
 ```
 
 - **Home (level 0)** lists every cached connection across accounts with a
   colored status dot: `●` green running, `○` gray idle, `●` red stopped
   while its target is unreachable, `◐` yellow running with the split-DNS
   resolver config missing.
-- **Connection view (level 1** — `enter`/`s`/… from home) shows the full
+- **Connection view (level 1)** — `enter`/`s`/… from home shows the full
   state card (tunnel, target reachability, DNS install state, selected
-  routes, the exact sshuttle command) with its own action row; `esc`
-  goes back.
+  routes, the exact sshuttle command). The header stays visible; `esc` goes
+  back.
+- **Shared header** — contextual key hints and a compact bastion emblem appear
+  at the top right. On wider terminals, the header shows metadata and the
+  account of the selected connection. Search and command prompts appear
+  immediately above the active panel. Notifications overlay the panel without
+  changing its layout. The project link stays in the footer.
+- **GitHub footer** — the Octocat glyph requires a Nerd Font. iTerm uses the
+  plain-text `gh` mark by default; set `BASTIONCTL_ICONS=1` to enable the glyph
+  after configuring a Nerd Font. `BASTIONCTL_NO_ICONS=1` forces plain text in
+  any terminal.
 - **Single-key actions** fire on the highlighted row directly — no
   arrowing through a menu first.
+- **Search** — `/` filters the current view, `enter` applies the filter,
+  and `esc` clears it. Outside the editor, `esc` also clears applied filters.
 - **`:` command line** — type commands like `stop corp`, `logs`,
-  `dns install dns-split`, `rescan`, `new`, `help`; `tab` completes.
+  `dns install dns-split`, `rescan`, `new`, `help`. Matching commands and
+  connection names appear inline; `tab` accepts the suggestion.
 - **Offline mode** — if AWS STS is unreachable, bastionctl still starts
   and lets you browse/manage every cached connection (start/stop/status/
   logs/forget still work through the saved config); network-only actions
   (`new`, `rescan`) report the outage instead of crashing.
+- **Transient notices** — errors and one-off messages appear over the
+  panel with a countdown (`… · 4s`) and clear themselves after a few
+  seconds, or immediately on the next key press.
+- **Editing** — the header stays visible above the editor. Form and YAML
+  editors start in Vim-style normal mode.
+  Use `j`/`k` or arrows to navigate, `h`/`l` to move within text, `i` or
+  `a` to insert, `ctrl+o` to return to normal mode, `x` to delete, and `u` to
+  undo. `enter` opens field options. `ctrl+y` opens the syntax-highlighted
+  YAML editor, which also supports `o`, `dd`, and `/` search. `:w` or
+  `ctrl+s` saves to disk; `:wq` saves and closes, `:q` closes an unchanged
+  draft, and `:q!` discards unsaved edits. `esc` returns to the parent and
+  asks before discarding changes. `?` shows editor controls.
 
 All CLI flags keep working unchanged for scripting; non-TTY runs keep
 the classic single-shot print behavior. A fresh discovery save drops

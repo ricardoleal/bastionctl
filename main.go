@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ import (
 	"bastionctl/internal/dnsresolver"
 	"bastionctl/internal/netcidr"
 	"bastionctl/internal/probe"
+	"bastionctl/internal/project"
 	"bastionctl/internal/sshtest"
 	"bastionctl/internal/sshuttlecmd"
 	"bastionctl/internal/ui"
@@ -47,6 +49,43 @@ import (
 
 const probeTimeout = 3 * time.Second
 const verifyTimeout = 10 * time.Second
+
+// version is stamped at build time with
+// -ldflags "-X main.version=v1.2.3". When empty, the module version embedded
+// by the Go toolchain is used instead.
+var version = ""
+
+// buildVersion reports the version string shown by --version.
+func buildVersion() string {
+	if version != "" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	var revision, dirty string
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			if setting.Value == "true" {
+				dirty = "-dirty"
+			}
+		}
+	}
+	if revision != "" {
+		if len(revision) > 12 {
+			revision = revision[:12]
+		}
+		return "dev-" + revision + dirty
+	}
+	return "dev"
+}
 
 // extractDemoFlag removes a hidden --demo flag from os.Args and reports
 // whether it was present. Handled manually so flag.Parse keeps erroring on
@@ -92,6 +131,14 @@ func main() {
 	manageDNS := flag.Bool("manage-dns", false, "Install/remove the split-DNS OS resolver config automatically (sudo is used only for those system changes)")
 	dnsSetup := flag.Bool("dns-setup", false, "Install the selected connection's split-DNS resolver config and exit")
 	dnsTeardown := flag.Bool("dns-teardown", false, "Remove the selected connection's installed split-DNS resolver config and exit")
+	showVersion := flag.Bool("version", false, "Print the bastionctl version and exit")
+	flag.CommandLine.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Fprintf(flag.CommandLine.Output(), "\nProject: %s\n", project.URL)
+		fmt.Fprintln(flag.CommandLine.Output(), "Set BASTIONCTL_NO_ICONS=1 for a plain-text GitHub footer.")
+		fmt.Fprintln(flag.CommandLine.Output(), "In iTerm, set BASTIONCTL_ICONS=1 to enable the Nerd Font icon.")
+	}
 
 	// Hidden mode: --demo runs the browser against simulated state (no AWS,
 	// no config writes) for demos and screen recordings. It is peeled off
@@ -99,6 +146,12 @@ func main() {
 	demoRequested := extractDemoFlag()
 
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("bastionctl " + buildVersion())
+		fmt.Println("Project: " + project.URL)
+		return
+	}
 
 	if demoRequested {
 		if !ui.Interactive() {
@@ -983,8 +1036,10 @@ func actionLaunchTunnel(store *config.Store, accountID, profileName string, cfg 
 // k9s-style browser — what a bare interactive `./bastionctl` opens.
 //
 // runBrowser loops: gather state, run the full-screen UI, execute the single
-// Outcome it reports on the real terminal (sudo prompts, log streaming and
-// foreground tunnels all need the plain screen), then re-enter the UI.
+// Outcome it reports: plain-screen actions (foreground tunnels, real
+// terminal sudo prompts) still need the real screen; sudo password
+// fallback is answered by the in-app modal through CaptureSender, and
+// then re-enter the UI.
 // ---------------------------------------------------------------------------
 
 type browserEnv struct {
@@ -1006,6 +1061,62 @@ type browserEnv struct {
 	dnsToNS        string
 	openConnection string
 	openCfg        *config.Config
+
+	// uiSender/live program hook management: background action handlers
+	// use it to surface the sudo password modal into the running UI.
+	uiSenderMu sync.Mutex
+	uiSender   func(ui.Message)
+}
+
+// setUISender records (or clears, send == nil) the running browser
+// program's message hook. Clearing happens when RunApp returns, so
+// handlers never reach a stale program.
+func (env *browserEnv) setUISender(send func(ui.Message)) {
+	env.uiSenderMu.Lock()
+	defer env.uiSenderMu.Unlock()
+	env.uiSender = send
+}
+
+func (env *browserEnv) uiSenderHook() func(ui.Message) {
+	env.uiSenderMu.Lock()
+	defer env.uiSenderMu.Unlock()
+	return env.uiSender
+}
+
+// requestSudoPassword asks the active browser session to collect the sudo
+// password through an in-app modal. An empty reply means the user
+// cancelled. This is the dnsresolver PasswordPrompt implementation wired
+// into every in-browser resolver command.
+func (env *browserEnv) requestSudoPassword(attempt int, reason string) (string, error) {
+	send := env.uiSenderHook()
+	if send == nil {
+		return "", errors.New("no active session")
+	}
+	reasonText := "Enter your login password to authorize sudo."
+	if attempt > 1 {
+		reasonText = fmt.Sprintf("%s Enter your login password (attempt %d of 3).", reason, attempt)
+	}
+	reply := make(chan string, 1)
+	send(ui.SudoPasswordRequestMsg{Reason: reasonText, Reply: reply})
+	select {
+	case password := <-reply:
+		if password == "" {
+			return "", errors.New("cancelled")
+		}
+		return password, nil
+	case <-time.After(90 * time.Second):
+		return "", errors.New("password prompt timed out")
+	}
+}
+
+// browserDNSOptions builds resolver options for in-browser (non-tty)
+// execution, wired to the in-app sudo authorization flow instead of the
+// fail-fast error.
+func browserDNSOptions(env *browserEnv) *dnsresolver.Options {
+	options := dnsresolver.DefaultOptions()
+	options.TerminalIn = false
+	options.PasswordPrompt = env.requestSudoPassword
+	return options
 }
 
 type browserFailure struct{ err error }
@@ -1071,13 +1182,16 @@ func runBrowser(env *browserEnv) {
 		}
 
 		account := ""
+		accountLabels := make(map[string]string)
 		if env.identityErr == nil {
 			account = formatAccount(env.identity.AccountID, env.accountAlias)
+			accountLabels[env.identity.AccountID] = account
 		} else {
 			account = "(offline)"
 		}
 		outcome, err := ui.RunApp(ui.RunOptions{
 			Account:        account,
+			AccountLabels:  accountLabels,
 			Profile:        env.awsProfile,
 			AWSProfiles:    awsProfiles,
 			AWSRegions:     awsRegions,
@@ -1088,14 +1202,24 @@ func runBrowser(env *browserEnv) {
 			Summaries:      summaries,
 			Detail:         detail,
 			ConfigSnapshot: configSnapshot,
-			// Cached-sudo management: the TUI cannot let sudo prompt while
-			// it runs, so it verifies the timestamp, offers authentication
-			// with the terminal handed to sudo, and keeps it warm.
+			// Cached-sudo management: the TUI verifies and keeps the
+			// timestamp warm; authentication uses its masked password prompt.
 			SudoCheck: func() error {
 				return exec.Command("sudo", "-n", "-v").Run()
 			},
-			SudoAuthenticate: func() *exec.Cmd {
-				return exec.Command("sudo", "-v")
+			SudoAuthenticate: func(password string) error {
+				ctx, cancel := context.WithTimeout(env.ctx, 30*time.Second)
+				defer cancel()
+				command := exec.CommandContext(ctx, "sudo", "-S", "-p", "", "-v")
+				command.Stdin = strings.NewReader(password + "\n")
+				output, err := command.CombinedOutput()
+				if ctx.Err() != nil {
+					return fmt.Errorf("sudo authentication timed out: %w", ctx.Err())
+				}
+				if err != nil {
+					return fmt.Errorf("sudo: %w: %s", err, strings.TrimSpace(string(output)))
+				}
+				return nil
 			},
 			RefreshConfigs: func() ([]*config.Config, error) {
 				return listAllConnections(env.store, env.configRoot)
@@ -1188,11 +1312,11 @@ func runBrowser(env *browserEnv) {
 					if err := env.store.Delete(accountID, name); err != nil {
 						return fmt.Errorf("renaming connection: %w", err)
 					}
-					if _, err := removeBrowserDNSState(env.store, accountID, name); err != nil {
+					if _, err := removeBrowserDNSState(env, accountID, name); err != nil {
 						return fmt.Errorf("connection saved, but old DNS state could not be removed: %w", err)
 					}
 				}
-				if err := reconcileDNSInBrowser(env.store, accountID, newName, cfg, env.manageDNS); err != nil {
+				if err := reconcileDNSInBrowser(env, accountID, newName, cfg, env.manageDNS); err != nil {
 					return fmt.Errorf("connection saved, but DNS reconciliation failed: %w", err)
 				}
 				return nil
@@ -1233,11 +1357,16 @@ func runBrowser(env *browserEnv) {
 				if err := env.store.Save(cfg.AccountID, cfg.Name, cfg); err != nil {
 					return err
 				}
-				if err := reconcileDNSInBrowser(env.store, cfg.AccountID, cfg.Name, cfg, env.manageDNS); err != nil {
+				if err := reconcileDNSInBrowser(env, cfg.AccountID, cfg.Name, cfg, env.manageDNS); err != nil {
 					return fmt.Errorf("connection saved, but DNS reconciliation failed: %w", err)
 				}
 				return nil
 			},
+			CaptureSender: func(send func(ui.Message)) {
+				// RunApp registers the live hook and clears it on return.
+				env.setUISender(send)
+			},
+			Version: buildVersion(),
 		})
 		pendingError = ""
 		if err != nil {
@@ -1612,11 +1741,10 @@ func browserStartResult(env *browserEnv, bin, name string) (ui.ActionResult, err
 	manageDNS := (cfg.DNS != nil && cfg.DNS.ManageResolver) || env.manageDNS
 	var installed *dnsresolver.State
 	if cfg.DNS != nil && cfg.DNS.EffectiveMode() == config.DNSModeSplit && manageDNS {
-		options := dnsresolver.DefaultOptions()
-		options.TerminalIn = false
+		options := browserDNSOptions(env)
 		installed, err = options.Install(cfg, statePath)
 		if err != nil {
-			return ui.ActionResult{}, fmt.Errorf("installing split-DNS resolver noninteractively: %w", err)
+			return ui.ActionResult{}, fmt.Errorf("installing split-DNS resolver: %w", err)
 		}
 	}
 	ctx, cancel := context.WithTimeout(env.ctx, 90*time.Second)
@@ -1637,8 +1765,7 @@ func browserStartResult(env *browserEnv, bin, name string) (ui.ActionResult, err
 	pid, output, startErr := sshuttlecmd.StartBackgroundCaptured(ctx, bin, sshuttlecmd.BuildArgs(cfg), pidFile, environment)
 	if startErr != nil {
 		if installed != nil {
-			options := dnsresolver.DefaultOptions()
-			options.TerminalIn = false
+			options := browserDNSOptions(env)
 			_, cleanupErr := options.Remove(installed)
 			_ = os.Remove(statePath)
 			if cleanupErr != nil {
@@ -1672,11 +1799,10 @@ func browserLaunchStream(env *browserEnv, bin, name string) (*ui.LogSession, err
 	manageDNS := (cfg.DNS != nil && cfg.DNS.ManageResolver) || env.manageDNS
 	var installed *dnsresolver.State
 	if cfg.DNS != nil && cfg.DNS.EffectiveMode() == config.DNSModeSplit && manageDNS {
-		options := dnsresolver.DefaultOptions()
-		options.TerminalIn = false
+		options := browserDNSOptions(env)
 		installed, err = options.Install(cfg, statePath)
 		if err != nil {
-			return nil, fmt.Errorf("installing split-DNS resolver noninteractively: %w", err)
+			return nil, fmt.Errorf("installing split-DNS resolver: %w", err)
 		}
 	}
 	environment := map[string]string{
@@ -1694,7 +1820,7 @@ func browserLaunchStream(env *browserEnv, bin, name string) (*ui.LogSession, err
 			processErr = <-process.Done
 		}
 		if installed != nil {
-			if _, cleanupErr := removeBrowserDNSState(env.store, cfg.AccountID, name); cleanupErr != nil {
+			if _, cleanupErr := removeBrowserDNSState(env, cfg.AccountID, name); cleanupErr != nil {
 				processErr = errors.Join(processErr, fmt.Errorf("removing split-DNS resolver config: %w", cleanupErr))
 			}
 		}
@@ -1721,7 +1847,7 @@ func browserStopResult(env *browserEnv, name string) (ui.ActionResult, error) {
 	if wasRunning {
 		body = fmt.Sprintf("%s stopped (PID %d).", name, pid)
 	}
-	dnsMessage, err := removeBrowserDNSState(env.store, cfg.AccountID, name)
+	dnsMessage, err := removeBrowserDNSState(env, cfg.AccountID, name)
 	if err != nil {
 		return ui.ActionResult{Title: "Tunnel stopped; DNS cleanup failed", Body: body, Refresh: true}, fmt.Errorf("Split-DNS cleanup failed: %w", err)
 	}
@@ -1743,7 +1869,7 @@ func browserForgetResult(env *browserEnv, name string) (ui.ActionResult, error) 
 	if _, _, err := sshuttlecmd.StopBackground(pidFile); err != nil {
 		return ui.ActionResult{}, fmt.Errorf("stopping %s before forgetting it: %w", name, err)
 	}
-	if _, err := removeBrowserDNSState(env.store, cfg.AccountID, name); err != nil {
+	if _, err := removeBrowserDNSState(env, cfg.AccountID, name); err != nil {
 		return ui.ActionResult{}, fmt.Errorf("connection was not removed because DNS cleanup failed: %w", err)
 	}
 	if err := env.store.Delete(cfg.AccountID, name); err != nil {
@@ -1764,11 +1890,10 @@ func browserDNSSetupResult(env *browserEnv, name string) (ui.ActionResult, error
 	if err != nil {
 		return ui.ActionResult{}, err
 	}
-	options := dnsresolver.DefaultOptions()
-	options.TerminalIn = false
+	options := browserDNSOptions(env)
 	state, err := options.Install(cfg, statePath)
 	if err != nil {
-		return ui.ActionResult{}, fmt.Errorf("installing split-DNS resolver noninteractively: %w", err)
+		return ui.ActionResult{}, fmt.Errorf("installing split-DNS resolver: %w", err)
 	}
 	return ui.ActionResult{Title: "Split DNS installed", Body: state.Describe(), Refresh: true}, nil
 }
@@ -1778,7 +1903,7 @@ func browserDNSTeardownResult(env *browserEnv, name string) (ui.ActionResult, er
 	if err != nil {
 		return ui.ActionResult{}, err
 	}
-	body, err := removeBrowserDNSState(env.store, cfg.AccountID, name)
+	body, err := removeBrowserDNSState(env, cfg.AccountID, name)
 	if err != nil {
 		return ui.ActionResult{}, err
 	}
@@ -1788,8 +1913,8 @@ func browserDNSTeardownResult(env *browserEnv, name string) (ui.ActionResult, er
 	return ui.ActionResult{Title: "Split DNS removed", Body: body, Refresh: true}, nil
 }
 
-func removeBrowserDNSState(store *config.Store, accountID, name string) (string, error) {
-	statePath, err := profileDNSStateFile(store, accountID, name)
+func removeBrowserDNSState(env *browserEnv, accountID, name string) (string, error) {
+	statePath, err := profileDNSStateFile(env.store, accountID, name)
 	if err != nil {
 		return "", err
 	}
@@ -1800,8 +1925,7 @@ func removeBrowserDNSState(store *config.Store, accountID, name string) (string,
 	if state == nil {
 		return "", nil
 	}
-	options := dnsresolver.DefaultOptions()
-	options.TerminalIn = false
+	options := browserDNSOptions(env)
 	warnings, err := options.Remove(state)
 	if err != nil {
 		return "", err
@@ -1812,8 +1936,8 @@ func removeBrowserDNSState(store *config.Store, accountID, name string) (string,
 	return strings.Join(warnings, "\n"), nil
 }
 
-func reconcileDNSInBrowser(store *config.Store, accountID, name string, cfg *config.Config, manageOverride bool) error {
-	statePath, err := profileDNSStateFile(store, accountID, name)
+func reconcileDNSInBrowser(env *browserEnv, accountID, name string, cfg *config.Config, manageOverride bool) error {
+	statePath, err := profileDNSStateFile(env.store, accountID, name)
 	if err != nil {
 		return err
 	}
@@ -1822,8 +1946,7 @@ func reconcileDNSInBrowser(store *config.Store, accountID, name string, cfg *con
 		return err
 	}
 	managedSplit := cfg.DNS != nil && cfg.DNS.EffectiveMode() == config.DNSModeSplit && (cfg.DNS.ManageResolver || manageOverride)
-	options := dnsresolver.DefaultOptions()
-	options.TerminalIn = false
+	options := browserDNSOptions(env)
 	if managedSplit {
 		_, err := options.Install(cfg, statePath)
 		return err

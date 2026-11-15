@@ -21,7 +21,8 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "bastionctl/internal/ui/tea"
+
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
@@ -131,7 +132,11 @@ type demoDriver struct {
 func newDemoHome(width, height int) appModel {
 	model := appModel{
 		options: RunOptions{
-			Account:   "123456789012 (prod) · 014498740021 (staging)",
+			Account: "demo",
+			AccountLabels: map[string]string{
+				"123456789012": "123456789012 (prod)",
+				"014498740021": "014498740021 (staging)",
+			},
 			Summaries: mockSummaries(),
 		},
 		home: newHomeTable(mockSummaries(), 0),
@@ -142,8 +147,15 @@ func newDemoHome(width, height int) appModel {
 
 func newDemoDetail(width, height int, detail *ConnDetail) appModel {
 	model := appModel{
-		options: RunOptions{Level: 1, Detail: detail, Summaries: mockSummaries()},
-		home:    newHomeTable(mockSummaries(), 0),
+		options: RunOptions{
+			Account: "demo",
+			AccountLabels: map[string]string{
+				"123456789012": "123456789012 (prod)",
+				"014498740021": "014498740021 (staging)",
+			},
+			Level: 1, Detail: detail, Summaries: mockSummaries(),
+		},
+		home: newHomeTable(mockSummaries(), 0),
 	}
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: width, Height: height})
 	return updated.(appModel)
