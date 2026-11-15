@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: go mod download
@@ -38,7 +38,7 @@ jobs:
             goarch: arm64
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: mkdir -p dist
@@ -53,7 +53,7 @@ jobs:
             VERSION="dev-${GITHUB_SHA:0:12}"
           fi
           go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "dist/bastionctl-${GOOS}-${GOARCH}" .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bastionctl-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/bastionctl-*
@@ -64,14 +64,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - name: Generate checksums
         run: sha256sum dist/bastionctl-* > dist/checksums.txt
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/bastionctl-*
