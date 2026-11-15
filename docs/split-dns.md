@@ -21,11 +21,11 @@ change the local OS resolver.
 
 ## Modes
 
-| `dns.mode` | sshuttle flags | Meaning |
-| --- | --- | --- |
-| `off` (default) | none | Route selected subnets only. |
-| `all` | `--dns --to-ns <IP>` | Send all DNS through the VPC resolver or configured forwarder. |
-| `split` | `--ns-hosts <IP>` and optional `--to-ns` | Send only configured domains to the VPC resolver. |
+| `dns.mode`      | sshuttle flags                           | Meaning                                                        |
+| --------------- | ---------------------------------------- | -------------------------------------------------------------- |
+| `off` (default) | none                                     | Route selected subnets only.                                   |
+| `all`           | `--dns --to-ns <IP>`                     | Send all DNS through the VPC resolver or configured forwarder. |
+| `split`         | `--ns-hosts <IP>` and optional `--to-ns` | Send only configured domains to the VPC resolver.              |
 
 ```mermaid
 flowchart LR
