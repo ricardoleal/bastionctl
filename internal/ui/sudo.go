@@ -3,7 +3,7 @@ package ui
 import (
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "bastionctl/internal/ui/tea"
 )
 
 // sudoState tracks whether cached sudo credentials are available. Starting or
@@ -26,8 +26,7 @@ const (
 	// timestamp is still valid.
 	sudoWarmInterval = 4 * time.Minute
 
-	// sudoAuthConfirm marks the modal that offers interactive sudo
-	// authentication; Enter hands the terminal to sudo, Esc skips.
+	// sudoAuthConfirm marks the modal that offers in-app sudo authentication.
 	sudoAuthConfirm = "sudo-auth"
 )
 
@@ -60,12 +59,11 @@ func (m appModel) warmSudoCmd() tea.Cmd {
 	return tea.Tick(sudoWarmInterval, func(time.Time) tea.Msg { return sudoWarmTickMsg{} })
 }
 
-// authenticateSudoCmd runs `sudo -v` with the real terminal: bubbletea
-// suspends the TUI, sudo prompts for the password, and the TUI redraws
-// cleanly afterwards.
-func (m appModel) authenticateSudoCmd() tea.Cmd {
+// authenticateSudoCmd validates the password without handing the terminal
+// away from the TUI.
+func (m appModel) authenticateSudoCmd(password string) tea.Cmd {
 	authenticate := m.options.SudoAuthenticate
-	return tea.ExecProcess(authenticate(), func(err error) tea.Msg { return sudoAuthDoneMsg{err: err} })
+	return func() tea.Msg { return sudoAuthDoneMsg{err: authenticate(password)} }
 }
 
 // guardSudo intercepts an action that needs root when the cached timestamp is
@@ -79,7 +77,7 @@ func (m *appModel) guardSudo(action, connection, view string) bool {
 	m.actionID++
 	m.actionModal = &actionModal{
 		id: m.actionID, title: "Sudo authentication",
-		body:          "Starting or stopping a tunnel needs sudo (firewall rules, split-DNS resolver files). Press Enter to authenticate — sudo will ask for your password — or Esc to skip.",
+		body:          "Starting or stopping a tunnel needs sudo (firewall rules, split-DNS resolver files). Press Enter to enter your password, or Esc to skip.",
 		confirmAction: sudoAuthConfirm, confirmConnection: connection,
 	}
 	return true

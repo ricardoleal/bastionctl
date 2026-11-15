@@ -1,13 +1,67 @@
 package main
 
 import (
+	"flag"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
 	"bastionctl/internal/config"
 	"bastionctl/internal/probe"
+	"bastionctl/internal/project"
 	"bastionctl/internal/ui"
 )
+
+func TestBuildVersionPrefersLdflagsOverride(t *testing.T) {
+	original := version
+	version = "v9.9.9"
+	t.Cleanup(func() { version = original })
+	if got := buildVersion(); got != "v9.9.9" {
+		t.Fatalf("buildVersion() = %q, want v9.9.9", got)
+	}
+}
+
+func TestBuildVersionFallsBackToANonEmptyString(t *testing.T) {
+	original := version
+	version = ""
+	t.Cleanup(func() { version = original })
+	if got := buildVersion(); got == "" {
+		t.Fatal("buildVersion() returned an empty string")
+	}
+}
+
+func TestCLIProjectInfo(t *testing.T) {
+	for _, argument := range []string{"--version", "--help"} {
+		t.Run(argument, func(t *testing.T) {
+			command := exec.Command(os.Args[0], "-test.run=^TestCLIProjectInfoHelper$")
+			command.Env = append(os.Environ(), "BASTIONCTL_TEST_CLI="+argument)
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s: %v: %s", argument, err, output)
+			}
+			if !strings.Contains(string(output), project.URL) {
+				t.Fatalf("%s missing project URL: %s", argument, output)
+			}
+			if argument == "--help" && !strings.Contains(string(output), "BASTIONCTL_NO_ICONS=1") {
+				t.Fatalf("help missing icon fallback: %s", output)
+			}
+			if argument == "--help" && !strings.Contains(string(output), "BASTIONCTL_ICONS=1") {
+				t.Fatalf("help missing iTerm icon opt-in: %s", output)
+			}
+		})
+	}
+}
+
+func TestCLIProjectInfoHelper(t *testing.T) {
+	argument := os.Getenv("BASTIONCTL_TEST_CLI")
+	if argument == "" {
+		return
+	}
+	os.Args = []string{"bastionctl", argument}
+	flag.CommandLine = flag.NewFlagSet("bastionctl", flag.ExitOnError)
+	main()
+}
 
 func TestBrowserStatusResultForStoppedConnection(t *testing.T) {
 	store := config.NewStore(t.TempDir())

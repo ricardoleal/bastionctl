@@ -5,10 +5,11 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "bastionctl/internal/ui/tea"
 
 	"bastionctl/internal/config"
 	"bastionctl/internal/probe"
+	"bastionctl/internal/project"
 )
 
 func TestSelectModelKeyboardSelection(t *testing.T) {
@@ -87,13 +88,13 @@ func TestSelectModelViewSlicesToTerminalHeight(t *testing.T) {
 	model = updated.(selectModel)
 
 	view := model.View()
-	if !strings.Contains(view, "choice-06") {
-		t.Fatalf("pgdn should land on item 6, view: %q", view)
+	if !strings.Contains(view, "choice-05") {
+		t.Fatalf("pgdn should land on item 5, view: %q", view)
 	}
 	if strings.Contains(view, "choice-39") {
 		t.Fatalf("items beyond the window must not render: %q", view)
 	}
-	if !strings.Contains(view, "7/40") {
+	if !strings.Contains(view, "6/40") {
 		t.Fatalf("position indicator missing: %q", view)
 	}
 }
@@ -114,13 +115,25 @@ func TestRouteModelViewScrollsLongNetworkLists(t *testing.T) {
 	if strings.Count(view, "\n") > 12+1 {
 		t.Fatalf("view exceeds terminal height: %d lines", strings.Count(view, "\n"))
 	}
-	// pgdn from 1 by page size (12-4 reserved = 8 lines budget / 2 per item = 4)
-	// should land on row 5.
-	if model.cursor != 5 {
-		t.Fatalf("cursor = %d, want 5", model.cursor)
+	if model.cursor != 4 {
+		t.Fatalf("cursor = %d, want 4", model.cursor)
 	}
-	if !strings.Contains(view, "10.5.0.0/16") {
+	if !strings.Contains(view, "10.4.0.0/16") {
 		t.Fatalf("cursor route not visible: %q", view)
+	}
+}
+
+func TestStandaloneSelectorsShowProjectFooter(t *testing.T) {
+	selectView := selectModel{title: "select", choices: []Choice{{Title: "one"}}, width: 120, height: 20}.View()
+	routeView := routeModel{routes: []config.NetworkRoute{{CIDR: "10.0.0.0/16"}}, width: 120, height: 20}.View()
+	candidate := newCandidateModel([]probe.Candidate{{Name: "pivot"}})
+	updated, _ := candidate.Update(tea.WindowSizeMsg{Width: 120, Height: 20})
+	candidateView := updated.(candidateModel).View()
+	for name, view := range map[string]string{"select": selectView, "routes": routeView, "candidate": candidateView} {
+		rows := strings.Split(view, "\n")
+		if !strings.Contains(rows[len(rows)-1], project.Repository) {
+			t.Fatalf("%s: project footer missing: %q", name, rows[len(rows)-1])
+		}
 	}
 }
 
@@ -165,7 +178,7 @@ func TestCandidateTableResizeAcrossColumnBuckets(t *testing.T) {
 		}
 	}
 	// newCandidateModel starts at width 120 (5 columns). Resizing to a width
-	// with more columns (6) or fewer (3) must not panic the bubbles table.
+	// with more columns (6) or fewer (3) must not panic the table.
 	model := newCandidateModel(candidates)
 	for _, width := range []int{150, 70, 200, 120} {
 		updated, _ := model.Update(tea.WindowSizeMsg{Width: width, Height: 30})
@@ -179,7 +192,7 @@ func TestHomeTableRendersStatusColumns(t *testing.T) {
 		{Name: "analytics", Account: "123456789012", Kind: "vpc", Method: "ssm", Region: "eu-central-1", Networks: "10.0.0.0/16", DNS: "off", Running: true, PID: 123},
 		{Name: "operations", Account: "123456789012", Kind: "dedicated", Method: "ssh", Region: "eu-west-1", Networks: "10.20.0.0/16", DNS: "off"},
 	}
-	// Resizing across column tiers must not panic the bubbles table.
+	// Resizing across column tiers must not panic the table.
 	model := newHomeTable(summaries, 0)
 	for _, width := range []int{160, 120, 100, 70, 200, 120} {
 		model, _ = model.Update(tea.WindowSizeMsg{Width: width, Height: 30})

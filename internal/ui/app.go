@@ -18,17 +18,19 @@ package ui
 import (
 	"fmt"
 	"net/netip"
-	"os/exec"
 	"reflect"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
-	"github.com/charmbracelet/bubbles/table"
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"gopkg.in/yaml.v3"
 
 	"bastionctl/internal/config"
+	"bastionctl/internal/ui/table"
+	tea "bastionctl/internal/ui/tea"
+	"bastionctl/internal/ui/textinput"
 )
 
 var ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
@@ -85,7 +87,7 @@ func (s ConnSummary) AWSProfileLabel() string {
 	return s.AWSProfile
 }
 
-// StatusLabel renders a plain-text home-table status cell. The bubbles table
+// StatusLabel renders a plain-text home-table status cell. The table widget
 // truncates embedded ANSI escapes as visible text, so keep this cell unstyled.
 func (s ConnSummary) StatusLabel() string {
 	switch {
@@ -198,7 +200,8 @@ type LogSession struct {
 
 // RunOptions parametrizes one RunApp session.
 type RunOptions struct {
-	Account           string                            // header context (account id/alias)
+	Account           string // header context (account id/alias)
+	AccountLabels     map[string]string
 	Profile           string                            // AWS profile shown in the header ("" = default)
 	Offline           bool                              // AWS is unreachable: browse cached connections only
 	Error             string                            // error carried back into the next browser frame
@@ -227,11 +230,25 @@ type RunOptions struct {
 	SaveNewConfig     func(*config.Config) error
 	// SudoCheck verifies the cached sudo timestamp noninteractively
 	// (`sudo -n -v`); nil disables all sudo handling (demo mode, tests).
-	// SudoAuthenticate returns the interactive `sudo -v` command the UI
-	// runs via tea.ExecProcess when the user accepts authentication.
+	// SudoAuthenticate validates a password entered in the in-app prompt.
 	SudoCheck        func() error
-	SudoAuthenticate func() *exec.Cmd
+	SudoAuthenticate func(string) error
+	// CaptureSender, when set, receives the live program's Send hook right
+	// before RunApp blocks. Background action handlers then surface
+	// in-app prompts (e.g. the sudo password field) into the UI:
+	// SudoPasswordRequestMsg shows the modal, and the reply channel gets
+	// the password ("" when the user cancelled). The hook must stop being
+	// used after RunApp returns.
+	CaptureSender func(func(Message))
+
+	// Version is the build version shown on the home dashboard. Empty
+	// falls back to "dev".
+	Version string
 }
+
+// Message is the value type exchanged with the interactive browser. It is an
+// alias for the runtime's message type so callers do not need to import it.
+type Message = tea.Msg
 
 // RunApp opens the interactive two-level browser and returns its outcome.
 func RunApp(options RunOptions) (Outcome, error) {
@@ -240,6 +257,7 @@ func RunApp(options RunOptions) (Outcome, error) {
 		knownConfigs: options.ConfigSnapshot,
 		home:         newHomeTable(options.Summaries, options.Highlight),
 		errorMsg:     options.Error,
+		errorTTL:     noticeTTLSeconds,
 		outcome:      Outcome{View: ViewHome},
 	}
 	if options.Level == 1 {
@@ -249,11 +267,43 @@ func RunApp(options RunOptions) (Outcome, error) {
 		model.outcome.Connection = options.Detail.Name
 		model.outcome.View = ViewConnection
 	}
-	result, err := tea.NewProgram(model, tea.WithAltScreen()).Run()
+	program := tea.NewProgram(model, tea.WithAltScreen())
+	clearCaptureSender := registerCaptureSender(options.CaptureSender, program.Send)
+	defer clearCaptureSender()
+	result, err := program.Run()
 	if err != nil {
 		return Outcome{Quit: true}, err
 	}
 	return result.(appModel).outcome, nil
+}
+
+func registerCaptureSender(capture func(func(Message)), send func(Message)) func() {
+	if capture == nil {
+		return func() {}
+	}
+	capture(send)
+	return func() { capture(nil) }
+}
+
+// ---------------------------------------------------------------------------
+// Sudo authorization modal
+// ---------------------------------------------------------------------------
+
+// SudoPasswordRequestMsg asks the running UI to collect a sudo password
+// through an in-app modal. Background action handlers send it through the
+// Send hook delivered by RunOptions.CaptureSender. Reply (which must be
+// buffered, size 1) receives the typed password, or "" on cancel.
+type SudoPasswordRequestMsg struct {
+	Reason string        // context line shown above the input
+	Reply  chan<- string // receives the password, or "" on cancel
+}
+
+// sudoPasswordPrompt is the modal state while a SudoPasswordRequestMsg is
+// active: a masked text input plus the reply channel to answer on.
+type sudoPasswordPrompt struct {
+	request      SudoPasswordRequestMsg
+	input        textinput.Model
+	authenticate bool
 }
 
 // ---------------------------------------------------------------------------
@@ -261,37 +311,37 @@ func RunApp(options RunOptions) (Outcome, error) {
 // ---------------------------------------------------------------------------
 
 type appModel struct {
-	options        RunOptions
-	knownConfigs   []*config.Config
-	width          int
-	height         int
-	home           table.Model
-	searching      bool
-	searchInput    string
-	searchFilter   string
-	searchFilters  map[string]string
-	searchTarget   string
-	searchOriginal string
-	shell          bool // the `:` command line is open
-	shellInput     string
-	shellIndex     int    // tab-completion cycle position
-	help           bool   // the `?` navigation help overlay is shown
-	errorMsg       string // cleared on the next key press
-	loadingDetail  string
-	actionID       int
-	actionModal    *actionModal
-	logSession     *LogSession
-	logLines       []string
-	logOffset      int
-	logDone        bool
-	logError       error
-	logTitle       string
-	editor         *connectionEditor
-	rescan         *rescanSelector
-	newWizard      *newConnectionWizard
-	sudo           sudoState
-	sudoPending    *sudoRequest
-	outcome        Outcome
+	options       RunOptions
+	knownConfigs  []*config.Config
+	width         int
+	height        int
+	home          table.Model
+	searching     bool
+	searchInput   string
+	searchFilter  string
+	searchFilters map[string]string
+	searchTarget  string
+	shell         bool // the `:` command line is open
+	shellInput    string
+	help          bool   // the `?` navigation help overlay is shown
+	errorMsg      string // transient notice shown in the footer
+	errorTTL      int    // seconds left before errorMsg clears itself
+	loadingDetail string
+	actionID      int
+	actionModal   *actionModal
+	logSession    *LogSession
+	logLines      []string
+	logOffset     int
+	logDone       bool
+	logError      error
+	logTitle      string
+	editor        *connectionEditor
+	rescan        *rescanSelector
+	newWizard     *newConnectionWizard
+	sudo          sudoState
+	sudoPending   *sudoRequest
+	sudoPrompt    *sudoPasswordPrompt
+	outcome       Outcome
 }
 
 const (
@@ -370,6 +420,7 @@ type configLoadedMsg struct {
 
 type configRefreshTickMsg struct{}
 type statusTickMsg struct{}
+type noticeTickMsg struct{}
 type statusRefreshedMsg struct{ summaries []ConnSummary }
 type configRefreshedMsg struct {
 	configs []*config.Config
@@ -424,6 +475,7 @@ type connectionEditor struct {
 	originalName  string
 	field         int
 	input         string
+	cursor        int // rune offset of the caret inside input
 	fields        []string
 	values        []string
 	profiles      []string
@@ -439,6 +491,26 @@ type connectionEditor struct {
 	addingRoute   bool
 	routeInput    string
 	routeError    string
+
+	// yamlMode is the inline YAML editor: yamlLines is the draft document,
+	// yamlRow/yamlCol the caret, and yamlOffset the first visible line.
+	yamlMode       bool
+	yamlLines      []string
+	yamlRow        int
+	yamlCol        int
+	yamlOffset     int
+	yamlError      string
+	vimInsert      bool
+	vimPending     bool
+	vimUndo        []editorSnapshot
+	vimPrompt      string
+	vimInput       string
+	vimSaving      bool
+	discardConfirm bool
+	discardTarget  string
+	savedValues    []string
+	savedRoutes    []config.NetworkRoute
+	yamlBaseline   string
 }
 
 type connectionRefreshedMsg struct {
@@ -447,6 +519,44 @@ type connectionRefreshedMsg struct {
 	summary ConnSummary
 	detail  *ConnDetail
 	err     error
+}
+
+// editorCursorEnd returns the caret offset just past s, where the caret sits
+// when a field gains focus.
+func editorCursorEnd(s string) int { return utf8.RuneCountInString(s) }
+
+// insertAtRune inserts text at a rune offset.
+func insertAtRune(s string, offset int, insert string) string {
+	runes := []rune(s)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(runes) {
+		offset = len(runes)
+	}
+	out := make([]rune, 0, len(runes)+len([]rune(insert)))
+	out = append(out, runes[:offset]...)
+	out = append(out, []rune(insert)...)
+	out = append(out, runes[offset:]...)
+	return string(out)
+}
+
+// deleteRuneBefore removes the rune just before a rune offset.
+func deleteRuneBefore(s string, offset int) string {
+	runes := []rune(s)
+	if offset <= 0 || offset > len(runes) {
+		return s
+	}
+	return string(append(runes[:offset-1], runes[offset:]...))
+}
+
+// deleteRuneAt removes the rune at a rune offset.
+func deleteRuneAt(s string, offset int) string {
+	runes := []rune(s)
+	if offset < 0 || offset >= len(runes) {
+		return s
+	}
+	return string(append(runes[:offset], runes[offset+1:]...))
 }
 
 func (m appModel) Init() tea.Cmd {
@@ -460,7 +570,44 @@ func (m appModel) Init() tea.Cmd {
 	if m.options.SudoCheck != nil {
 		cmds = append(cmds, m.checkSudoCmd())
 	}
+	cmds = append(cmds, m.nextNoticeTick())
 	return tea.Batch(cmds...)
+}
+
+// noticeTTLSeconds is how long a transient notice stays in the footer before
+// it clears itself. The footer shows the remaining seconds next to the text.
+const noticeTTLSeconds = 5
+
+// setError publishes a transient notice in the footer and (re)starts its
+// countdown.
+func (m *appModel) setError(text string) {
+	m.errorMsg = text
+	m.errorTTL = noticeTTLSeconds
+}
+
+// clearError dismisses the current notice immediately.
+func (m *appModel) clearError() {
+	m.errorMsg = ""
+	m.errorTTL = 0
+}
+
+// notice renders the footer notice with its remaining lifetime, e.g.
+// "4s · open corp: timeout". The countdown leads so that a long message
+// truncated on a narrow terminal never hides it. It is empty when there is
+// no notice.
+func (m appModel) notice() string {
+	if m.errorMsg == "" {
+		return ""
+	}
+	ttl := m.errorTTL
+	if ttl < 1 {
+		ttl = 1
+	}
+	return fmt.Sprintf("%ds · %s", ttl, m.errorMsg)
+}
+
+func (m appModel) nextNoticeTick() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return noticeTickMsg{} })
 }
 
 func (m appModel) level() int {
@@ -503,6 +650,20 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, func() tea.Msg {
 			return statusRefreshedMsg{summaries: refresh()}
 		}
+	case noticeTickMsg:
+		if m.errorMsg != "" {
+			if m.errorTTL <= 0 {
+				// A notice set without an explicit TTL starts its
+				// countdown now rather than vanishing immediately.
+				m.errorTTL = noticeTTLSeconds
+			} else {
+				m.errorTTL--
+			}
+			if m.errorTTL <= 0 {
+				m.clearError()
+			}
+		}
+		return m, m.nextNoticeTick()
 	case statusRefreshedMsg:
 		m.applyRefreshedStatus(message.summaries)
 		return m, m.nextStatusRefresh()
@@ -549,7 +710,7 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case configRefreshedMsg:
 		if message.err != nil {
 			if m.errorMsg == "" {
-				m.errorMsg = "config refresh: " + message.err.Error()
+				m.setError("config refresh: " + message.err.Error())
 			}
 			return m, m.nextConfigRefresh()
 		}
@@ -630,12 +791,13 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case configLoadedMsg:
 		if message.err != nil {
-			m.errorMsg = "edit: " + message.err.Error()
+			m.setError("edit: " + message.err.Error())
 			return m, nil
 		}
 		m.editor = newConnectionEditor(message.cfg, m.options.AWSProfiles, m.options.AWSRegions)
 		m.editor.field = min(message.startField, len(m.editor.fields)-1)
 		m.editor.input = m.editor.values[m.editor.field]
+		m.editor.cursor = 0
 		return m, nil
 	case logLineMsg:
 		if m.logSession == nil {
@@ -663,6 +825,8 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.actionModal = nil
 		}
 		return m, nil
+	case vimSaveFinishedMsg:
+		return m.finishVimSave(message)
 	case actionFinishedMsg:
 		if m.actionModal == nil || message.id != m.actionModal.id {
 			return m, nil
@@ -758,7 +922,7 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.actionModal.title = "Action completed; refresh failed"
 				m.actionModal.body += "\n" + message.err.Error()
 			} else {
-				m.errorMsg = "connection refresh failed: " + message.err.Error()
+				m.setError("connection refresh failed: " + message.err.Error())
 			}
 			return m, nil
 		}
@@ -773,17 +937,24 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.options.Detail = message.detail
 		}
 		return m, m.scheduleModalDismiss()
+	case SudoPasswordRequestMsg:
+		input := textinput.New()
+		input.EchoMode = textinput.EchoPassword
+		input.EchoCharacter = '•'
+		input.Focus()
+		m.sudoPrompt = &sudoPasswordPrompt{request: message, input: input}
+		return m, textinput.Blink
 	case detailLoadedMsg:
 		if message.name != m.loadingDetail {
 			return m, nil
 		}
 		m.loadingDetail = ""
 		if message.err != nil {
-			m.errorMsg = "open " + message.name + ": " + message.err.Error()
+			m.setError("open " + message.name + ": " + message.err.Error())
 			return m, nil
 		}
 		if message.detail == nil {
-			m.errorMsg = "open " + message.name + ": connection is no longer available"
+			m.setError("open " + message.name + ": connection is no longer available")
 			return m, nil
 		}
 		m.options.Level = 1
@@ -795,14 +966,47 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = message.Width
 		m.height = message.Height
-		m.home.SetWidth(max(message.Width, 40))
-		// Table photos: the table renders its own header line on top of
-		// the height rows, so reserve one line for it.
-		m.home.SetHeight(max(m.chrome().Budget(m.height)-1, 3))
+		m.home.SetWidth(max(m.homeTableWidth(), 40))
+		budget := m.chrome().Budget(m.height, m.width)
+		// The table sits inside the bordered panel, which adds two rows.
+		m.home.SetHeight(max(budget-2, 2))
 		m.refreshHomeTable(false)
 		return m, nil
 	case tea.KeyMsg:
 		key := message.String()
+		if m.sudoPrompt != nil {
+			return m.updateSudoPassword(key, message)
+		}
+		if m.editor != nil && m.editor.vimSaving {
+			return m, nil
+		}
+		if m.editor != nil && m.editor.discardConfirm {
+			switch key {
+			case "y":
+				m.editor.discardConfirm = false
+				switch m.editor.discardTarget {
+				case "route":
+					m.editor.routes = m.editor.routeOriginal
+					m.editor.routePicker = false
+				case "route-input":
+					m.editor.addingRoute = false
+					m.editor.routeInput = ""
+					m.editor.routeError = ""
+				default:
+					m.closeVimEditor()
+				}
+				if m.editor != nil {
+					m.editor.discardTarget = ""
+				}
+			case "n", "esc":
+				m.editor.discardConfirm = false
+				m.editor.discardTarget = ""
+			}
+			return m, nil
+		}
+		if m.editor != nil && m.editor.vimPrompt != "" {
+			return m.updateVimPrompt(key, message.Runes)
+		}
 		if m.searching {
 			return m.updateSearch(key, message.Runes)
 		}
@@ -822,7 +1026,12 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 							return m, nil
 						}
 						m.actionModal = nil
-						return m, m.authenticateSudoCmd()
+						input := textinput.New()
+						input.EchoMode = textinput.EchoPassword
+						input.EchoCharacter = '•'
+						input.Focus()
+						m.sudoPrompt = &sudoPasswordPrompt{input: input, authenticate: true}
+						return m, textinput.Blink
 					}
 					return m, nil
 				}
@@ -835,7 +1044,7 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 					handler := m.options.Actions[action]
 					if handler == nil {
 						m.actionModal = nil
-						m.errorMsg = "action is unavailable"
+						m.setError("action is unavailable")
 						return m, nil
 					}
 					m.actionID++
@@ -854,7 +1063,7 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.errorMsg != "" {
-			m.errorMsg = ""
+			m.clearError()
 		}
 		if m.help {
 			// The help overlay swallows exactly one key to dismiss itself;
@@ -864,6 +1073,40 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.shell {
 			return m.updateShell(key, message.Runes)
+		}
+		if key == "esc" && m.editor == nil {
+			scope := m.activeSearchScope()
+			if m.searchQuery(scope) != "" {
+				m.clearSearch(scope)
+				return m, nil
+			}
+		}
+		if m.editor != nil && key == "esc" {
+			editor := m.editor
+			switch {
+			case editor.routePicker && editor.addingRoute && editor.routeInput != "":
+				editor.discardConfirm, editor.discardTarget = true, "route-input"
+				return m, nil
+			case editor.routePicker && !editor.addingRoute && !reflect.DeepEqual(editor.routes, editor.routeOriginal):
+				editor.discardConfirm, editor.discardTarget = true, "route"
+				return m, nil
+			case !editor.routePicker && len(editor.choices) == 0:
+				if editor.isDirty() {
+					editor.discardConfirm = true
+				} else {
+					m.closeVimEditor()
+				}
+				return m, nil
+			}
+		}
+		if m.editor != nil && !m.editor.vimInsert && !m.editor.addingRoute && key == "?" {
+			m.help = true
+			return m, nil
+		}
+		// The inline YAML editor owns every key, including "/" (needed for
+		// CIDRs and paths) and q/?/: which are ordinary YAML characters there.
+		if m.editor != nil && (m.editor.yamlMode || m.editor.vimInsert) {
+			return m.updateEditor(key, message.Runes)
 		}
 		if key == "/" {
 			m.beginSearch()
@@ -894,7 +1137,6 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case ":":
 			m.shell = true
 			m.shellInput = ""
-			m.shellIndex = 0
 			return m, nil
 		case "esc":
 			if m.level() == 1 {
@@ -906,9 +1148,9 @@ func (m appModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.outcome.View = ViewHome
 				return m, nil
 			}
-			// At home there is nothing to go back to.
-			m.outcome.Quit = true
-			return m, tea.Quit
+			// At home there is nothing to go back to. Escape is a
+			// navigation key only; quitting is q / ctrl+c.
+			return m, nil
 		}
 		if m.level() == 1 {
 			return m.updateConnectionLevel(message, key)
@@ -1007,6 +1249,13 @@ func summaryFromConfig(cfg *config.Config, previous ConnSummary) ConnSummary {
 }
 
 func (m *appModel) applyRefreshedConfigs(configs []*config.Config) tea.Cmd {
+	visible := m.visibleSummaries()
+	cursor := m.home.Cursor()
+	hadSelection := cursor >= 0 && cursor < len(visible)
+	var selected ConnSummary
+	if hadSelection {
+		selected = visible[cursor]
+	}
 	oldByKey := make(map[string]*config.Config, len(m.knownConfigs))
 	newByKey := make(map[string]*config.Config, len(configs))
 	for _, cfg := range m.knownConfigs {
@@ -1029,7 +1278,7 @@ func (m *appModel) applyRefreshedConfigs(configs []*config.Config) tea.Cmd {
 		for key, isChanged := range changed {
 			if isChanged && strings.HasSuffix(key, "\x00"+m.editor.originalName) {
 				m.editor.conflicted = true
-				m.errorMsg = "connection changed on disk; cancel and reopen edit before saving"
+				m.setError("connection changed on disk; cancel and reopen edit before saving")
 				break
 			}
 		}
@@ -1047,6 +1296,14 @@ func (m *appModel) applyRefreshedConfigs(configs []*config.Config) tea.Cmd {
 	m.options.Summaries = summaries
 	m.knownConfigs = configs
 	m.refreshHomeTable(false)
+	if hadSelection {
+		for index, summary := range m.visibleSummaries() {
+			if configKey(summary.Account, summary.Name) == configKey(selected.Account, selected.Name) {
+				m.home.SetCursor(index)
+				break
+			}
+		}
+	}
 
 	if m.level() != 1 || m.options.Detail == nil {
 		return m.nextConfigRefresh()
@@ -1062,7 +1319,7 @@ func (m *appModel) applyRefreshedConfigs(configs []*config.Config) tea.Cmd {
 	if current == nil {
 		m.options.Level = 0
 		m.options.Detail = nil
-		m.errorMsg = "connection removed from config"
+		m.setError("connection removed from config")
 		return m.nextConfigRefresh()
 	}
 	key := configKey(current.AccountID, current.Name)
@@ -1116,16 +1373,37 @@ func (m appModel) searchQuery(scope string) string {
 
 func (m *appModel) beginSearch() {
 	m.searchTarget = m.activeSearchScope()
-	m.searchOriginal = m.searchQuery(m.searchTarget)
-	m.searchInput = m.searchOriginal
+	m.searchInput = m.searchQuery(m.searchTarget)
 	m.searching = true
+}
+
+func (m *appModel) clearSearch(scope string) {
+	selected, hadSelection := m.dashboardSelection()
+	m.searching = false
+	m.searchInput = ""
+	if scope == searchHome {
+		m.searchFilter = ""
+		m.refreshHomeTable(true)
+		if hadSelection {
+			for index, summary := range m.visibleSummaries() {
+				if configKey(summary.Account, summary.Name) == configKey(selected.Account, selected.Name) {
+					m.home.SetCursor(index)
+					break
+				}
+			}
+		}
+	} else {
+		delete(m.searchFilters, scope)
+		if scope == searchLogs {
+			m.logOffset = 0
+		}
+	}
 }
 
 func (m appModel) updateSearch(key string, runes []rune) (tea.Model, tea.Cmd) {
 	switch key {
 	case "esc":
-		m.searching = false
-		m.searchInput = m.searchOriginal
+		m.clearSearch(m.searchTarget)
 	case "enter":
 		query := strings.TrimSpace(m.searchInput)
 		if m.searchTarget == searchHome {
@@ -1149,6 +1427,7 @@ func (m appModel) updateSearch(key string, runes []rune) (tea.Model, tea.Cmd) {
 				if indices := matchingEditorFields(m.editor, query); len(indices) > 0 {
 					m.editor.field = indices[0]
 					m.editor.input = m.editor.values[indices[0]]
+					m.editor.cursor = editorCursorEnd(m.editor.input)
 				}
 			}
 		case searchEditorChoices:
@@ -1244,10 +1523,7 @@ func (m *appModel) refreshHomeTable(resetCursor bool) {
 		cursor = 0
 	}
 	visible := m.visibleSummaries()
-	width := m.width
-	if width <= 0 {
-		width = 120
-	}
+	width := m.homeTableWidth()
 	columns, rows := homeLayout(visible, width)
 	safeSetColumnsRows(&m.home, columns, rows)
 	if cursor >= len(visible) {
@@ -1260,7 +1536,7 @@ func (m appModel) updateHomeLevel(message tea.Msg, key string) (tea.Model, tea.C
 	switch key {
 	case "enter":
 		if len(m.visibleSummaries()) == 0 {
-			m.errorMsg = "no saved connections yet — press n to scan for one"
+			m.setError("no saved connections yet — press n to scan for one")
 			return m, nil
 		}
 		m.outcome.Action = ActOpen
@@ -1278,7 +1554,7 @@ func (m appModel) updateHomeLevel(message tea.Msg, key string) (tea.Model, tea.C
 func (m appModel) fireHomeAction(key string) (tea.Model, tea.Cmd) {
 	name := m.currentName()
 	if name == "" {
-		m.errorMsg = "no saved connections yet — press n to scan for one"
+		m.setError("no saved connections yet — press n to scan for one")
 		return m, nil
 	}
 	var action string
@@ -1322,7 +1598,7 @@ func (m appModel) requestAction(action, connection, view string) (tea.Model, tea
 		return m.openConnection(connection)
 	}
 	if m.options.Offline && OfflineBlocks(action) {
-		m.errorMsg = "offline — " + action + " needs AWS connectivity (check network / credentials)"
+		m.setError("offline — " + action + " needs AWS connectivity (check network / credentials)")
 		return m, nil
 	}
 	if m.guardSudo(action, connection, view) {
@@ -1343,7 +1619,7 @@ func (m appModel) requestAction(action, connection, view string) (tea.Model, tea
 		m.outcome.Action = ""
 		session, err := m.options.StartLogs(connection)
 		if err != nil {
-			m.errorMsg = "logs: " + err.Error()
+			m.setError("logs: " + err.Error())
 			return m, nil
 		}
 		m.logSession = session
@@ -1368,7 +1644,7 @@ func (m appModel) requestAction(action, connection, view string) (tea.Model, tea
 		m.outcome.Action = ""
 		session, err := m.options.StartLaunch(connection)
 		if err != nil {
-			m.errorMsg = "launch: " + err.Error()
+			m.setError("launch: " + err.Error())
 			return m, nil
 		}
 		m.logSession = session
@@ -1484,7 +1760,7 @@ func newConnectionEditor(cfg *config.Config, profiles []string, regionOptions ..
 	if !regionKnown && cfg.Region != "" {
 		regions = append(regions, cfg.Region)
 	}
-	return &connectionEditor{cfg: cfg, originalName: cfg.Name, fields: []string{"name", "kind", "method", "region", "target", "ssh user", "ssh key", "ssh port", "vpc id", "subnet id", "instance id", "name tag", "routes", "dns mode", "dns resolvers", "dns domains", "dns to-ns", "manage resolver", "aws profile"}, values: values, profiles: profiles, regions: regions, routes: routes}
+	return &connectionEditor{cfg: cfg, originalName: cfg.Name, input: values[0], fields: []string{"name", "kind", "method", "region", "target", "ssh user", "ssh key", "ssh port", "vpc id", "subnet id", "instance id", "name tag", "routes", "dns mode", "dns resolvers", "dns domains", "dns to-ns", "manage resolver", "aws profile"}, values: values, profiles: profiles, regions: regions, routes: routes, savedValues: append([]string(nil), values...), savedRoutes: append([]config.NetworkRoute(nil), routes...)}
 }
 
 func editorRoutesLabel(routes []config.NetworkRoute) string {
@@ -1499,6 +1775,23 @@ func editorRoutesLabel(routes []config.NetworkRoute) string {
 
 func (m appModel) updateEditor(key string, runes []rune) (tea.Model, tea.Cmd) {
 	e := m.editor
+	if e.yamlMode {
+		return m.updateYAMLEditor(key, runes)
+	}
+	if !e.routePicker && len(e.choices) == 0 {
+		if key == "ctrl+s" || (!e.vimInsert && key == ":") {
+			if key == "ctrl+s" {
+				return m.saveVimEditor(false)
+			}
+			e.vimPrompt, e.vimInput = ":", ""
+			return m, nil
+		}
+		var handled bool
+		key, handled = e.vimKey(key, runes)
+		if handled {
+			return m, nil
+		}
+	}
 	if e.routePicker {
 		if e.addingRoute {
 			switch key {
@@ -1596,6 +1889,7 @@ func (m appModel) updateEditor(key string, runes []rune) (tea.Model, tea.Cmd) {
 			if position >= 0 {
 				e.values[e.field] = e.choices[e.choiceCursor]
 				e.input = e.values[e.field]
+				e.cursor = editorCursorEnd(e.input)
 				e.choices = nil
 			}
 		}
@@ -1606,30 +1900,42 @@ func (m appModel) updateEditor(key string, runes []rune) (tea.Model, tea.Cmd) {
 		m.editor = nil
 	case "up":
 		e.field = neighboringEditorField(e, m.searchQuery(searchEditor), -1)
+		e.cursor = max(editorCursorEnd(e.values[e.field])-1, 0)
 	case "down", "tab":
 		e.field = neighboringEditorField(e, m.searchQuery(searchEditor), 1)
+		e.cursor = max(editorCursorEnd(e.values[e.field])-1, 0)
 	case "left", "right":
-		if e.field == len(e.fields)-1 && len(e.profiles) > 0 {
-			index := 0
-			for i, profile := range e.profiles {
-				if profile == e.values[e.field] {
-					index = i
-					break
-				}
-			}
-			if key == "left" {
-				index = (index + len(e.profiles) - 1) % len(e.profiles)
-			} else {
-				index = (index + 1) % len(e.profiles)
-			}
-			e.values[e.field] = e.profiles[index]
-			e.input = e.values[e.field]
+		// Choice fields have no free-form caret; only the profile field
+		// above uses left/right for cycling.
+		if len(editorFieldChoices(e)) > 0 {
+			break
+		}
+		if key == "left" && e.cursor > 0 {
+			e.cursor--
+		}
+		last := utf8.RuneCountInString(e.input)
+		if !e.vimInsert {
+			last = max(last-1, 0)
+		}
+		if key == "right" && e.cursor < last {
+			e.cursor++
+		}
+	case "home":
+		e.cursor = 0
+	case "end":
+		e.cursor = utf8.RuneCountInString(e.input)
+		if !e.vimInsert {
+			e.cursor = max(e.cursor-1, 0)
+		}
+	case "ctrl+y":
+		if err := enterYAMLEditor(e); err != nil {
+			m.setError("yaml: " + err.Error())
 		}
 	case "v":
 		if m.options.CheckAWSProfile != nil {
 			cfg, err := editorConfig(e)
 			if err != nil {
-				m.errorMsg = "profile check: " + err.Error()
+				m.setError("profile check: " + err.Error())
 				return m, nil
 			}
 			checker, profile := m.options.CheckAWSProfile, e.values[len(e.values)-1]
@@ -1642,8 +1948,14 @@ func (m appModel) updateEditor(key string, runes []rune) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "backspace":
-		if len(e.input) > 0 {
-			e.input = e.input[:len(e.input)-1]
+		if e.cursor > 0 {
+			e.input = deleteRuneBefore(e.input, e.cursor)
+			e.cursor--
+			e.values[e.field] = e.input
+		}
+	case "delete":
+		if e.cursor < utf8.RuneCountInString(e.input) {
+			e.input = deleteRuneAt(e.input, e.cursor)
 			e.values[e.field] = e.input
 		}
 	case "enter":
@@ -1667,63 +1979,23 @@ func (m appModel) updateEditor(key string, runes []rune) (tea.Model, tea.Cmd) {
 		if e.field < len(e.fields)-1 {
 			e.field++
 			e.input = e.values[e.field]
+			e.cursor = max(editorCursorEnd(e.input)-1, 0)
 			break
 		}
-		m.errorMsg = "press ctrl+s to save the connection"
-	case "ctrl+s":
-		if e.conflicted {
-			m.errorMsg = "connection changed on disk; cancel and reopen edit before saving"
-			return m, nil
-		}
-		if e.isNew && m.options.SaveNewConfig == nil || !e.isNew && m.options.SaveConfig == nil {
-			m.errorMsg = "edit: saving is unavailable"
-			return m, nil
-		}
-		cfg, err := editorConfig(e)
-		if err != nil {
-			m.errorMsg = "edit: " + err.Error()
-			return m, nil
-		}
-		saver, name := m.options.SaveConfig, e.originalName
-		if e.isNew {
-			name = cfg.Name
-			saver = func(_ string, draft *config.Config) error { return m.options.SaveNewConfig(draft) }
-		}
-		m.editor = nil
-		m.actionID++
-		id := m.actionID
-		m.actionModal = &actionModal{id: id, title: "Saving connection", body: "Working…", running: true}
-		return m, func() tea.Msg {
-			var saveErr error
-			func() {
-				defer func() {
-					if recovered := recover(); recovered != nil {
-						if failure, ok := recovered.(error); ok {
-							saveErr = failure
-						} else {
-							saveErr = fmt.Errorf("saving connection: %v", recovered)
-						}
-					}
-				}()
-				saveErr = saver(name, cfg)
-			}()
-			return actionFinishedMsg{
-				id:            id,
-				result:        ActionResult{Title: "Connection saved", Body: cfg.Name},
-				err:           saveErr,
-				savedConfig:   cfg,
-				originalName:  name,
-				newConnection: e.isNew,
-			}
-		}
+		m.setError("press ctrl+s to save the connection")
 	default:
 		if len(runes) > 0 && len(editorFieldChoices(e)) == 0 {
-			e.input += string(runes)
+			text := string(runes)
+			e.input = insertAtRune(e.input, e.cursor, text)
+			e.cursor += utf8.RuneCountInString(text)
 			e.values[e.field] = e.input
 		}
 	}
 	if m.editor != nil {
 		e.input = e.values[e.field]
+		if !e.vimInsert {
+			e.cursor = min(e.cursor, max(editorCursorEnd(e.input)-1, 0))
+		}
 	}
 	return m, nil
 }
@@ -1764,11 +2036,11 @@ func (m appModel) updateRescan(key string) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		if m.options.SaveRescan == nil {
-			m.errorMsg = "rescan: saving is unavailable"
+			m.setError("rescan: saving is unavailable")
 			return m, nil
 		}
 		if position < 0 {
-			m.errorMsg = "rescan: no candidates match the search"
+			m.setError("rescan: no candidates match the search")
 			return m, nil
 		}
 		selected := selector.candidates[selector.cursor]
@@ -1941,7 +2213,7 @@ func (m appModel) updateNewWizard(key string) (tea.Model, tea.Cmd) {
 				}
 			}
 			if len(selected) == 0 {
-				m.errorMsg = "select at least one route"
+				m.setError("select at least one route")
 				return m, nil
 			}
 			candidate := wizard.candidate
@@ -1978,6 +2250,186 @@ func editorConfig(e *connectionEditor) (*config.Config, error) {
 		cfg.DNS = &config.DNSConfig{Mode: config.DNSMode(e.values[13]), Resolver: splitEditorList(e.values[14]), Domains: splitEditorList(e.values[15]), ToNS: strings.TrimSpace(e.values[16]), ManageResolver: strings.EqualFold(strings.TrimSpace(e.values[17]), "true")}
 	}
 	return &cfg, nil
+}
+
+// editorYAMLDocument renders the editor's live draft as YAML, or the error
+// that prevents rendering it.
+func editorYAMLDocument(e *connectionEditor) (string, error) {
+	cfg, err := editorConfig(e)
+	if err != nil {
+		return "", err
+	}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// enterYAMLEditor switches the editor into inline YAML mode, seeding the
+// buffer from the current draft.
+func enterYAMLEditor(e *connectionEditor) error {
+	document, err := editorYAMLDocument(e)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(strings.TrimRight(document, "\n"), "\n")
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	e.yamlMode = true
+	e.yamlLines = lines
+	e.yamlRow, e.yamlCol, e.yamlOffset = 0, 0, 0
+	e.yamlError = ""
+	e.yamlBaseline = strings.Join(lines, "\n")
+	e.vimInsert = false
+	e.vimUndo = nil
+	return nil
+}
+
+// applyYAMLToEditor parses the YAML buffer and rebuilds the field editor from
+// it. Identity/metadata (name, new/conflicted flags) is preserved.
+func applyYAMLToEditor(e *connectionEditor) error {
+	var cfg config.Config
+	if err := yaml.Unmarshal([]byte(strings.Join(e.yamlLines, "\n")), &cfg); err != nil {
+		return err
+	}
+	rebuilt := newConnectionEditor(&cfg, e.profiles, e.regions)
+	rebuilt.originalName = e.originalName
+	rebuilt.isNew = e.isNew
+	rebuilt.conflicted = e.conflicted
+	rebuilt.field = max(min(e.field, len(rebuilt.fields)-1), 0)
+	rebuilt.input = rebuilt.values[rebuilt.field]
+	rebuilt.cursor = editorCursorEnd(rebuilt.input)
+	*e = *rebuilt
+	return nil
+}
+
+// yamlClampCol keeps the caret inside the current line after vertical motion.
+func (e *connectionEditor) yamlClampCol() {
+	if e.yamlRow < 0 {
+		e.yamlRow = 0
+	}
+	if e.yamlRow >= len(e.yamlLines) {
+		e.yamlRow = len(e.yamlLines) - 1
+	}
+	if e.yamlRow < 0 {
+		e.yamlRow = 0
+		return
+	}
+	width := utf8.RuneCountInString(e.yamlLines[e.yamlRow])
+	if !e.vimInsert {
+		width = max(width-1, 0)
+	}
+	if e.yamlCol > width {
+		e.yamlCol = width
+	}
+	if e.yamlCol < 0 {
+		e.yamlCol = 0
+	}
+}
+
+// updateYAMLEditor drives the inline YAML editor and its Vim-style modes.
+func (m appModel) updateYAMLEditor(key string, runes []rune) (tea.Model, tea.Cmd) {
+	e := m.editor
+	if key == "ctrl+s" {
+		return m.saveVimEditor(false)
+	}
+	if !e.vimInsert && (key == ":" || key == "/") {
+		e.vimPrompt, e.vimInput = key, ""
+		return m, nil
+	}
+	var handled bool
+	key, handled = e.vimKey(key, runes)
+	if handled {
+		return m, nil
+	}
+	e.yamlError = ""
+	switch key {
+	case "up":
+		if e.yamlRow > 0 {
+			e.yamlRow--
+			e.yamlClampCol()
+		}
+	case "down":
+		if e.yamlRow < len(e.yamlLines)-1 {
+			e.yamlRow++
+			e.yamlClampCol()
+		}
+	case "left":
+		if e.yamlCol > 0 {
+			e.yamlCol--
+		} else if e.vimInsert && e.yamlRow > 0 {
+			e.yamlRow--
+			e.yamlCol = utf8.RuneCountInString(e.yamlLines[e.yamlRow])
+		}
+	case "right":
+		last := utf8.RuneCountInString(e.yamlLines[e.yamlRow])
+		if !e.vimInsert {
+			last = max(last-1, 0)
+		}
+		if e.yamlCol < last {
+			e.yamlCol++
+		} else if e.vimInsert && e.yamlRow < len(e.yamlLines)-1 {
+			e.yamlRow++
+			e.yamlCol = 0
+		}
+	case "home":
+		e.yamlCol = 0
+	case "end":
+		e.yamlCol = utf8.RuneCountInString(e.yamlLines[e.yamlRow])
+		if !e.vimInsert {
+			e.yamlCol = max(e.yamlCol-1, 0)
+		}
+	case "pgup":
+		e.yamlRow = max(e.yamlRow-10, 0)
+		e.yamlClampCol()
+	case "pgdown":
+		e.yamlRow = min(e.yamlRow+10, len(e.yamlLines)-1)
+		e.yamlClampCol()
+	case "backspace":
+		line := e.yamlLines[e.yamlRow]
+		if e.yamlCol > 0 {
+			e.yamlLines[e.yamlRow] = deleteRuneBefore(line, e.yamlCol)
+			e.yamlCol--
+		} else if e.yamlRow > 0 {
+			previous := e.yamlLines[e.yamlRow-1]
+			e.yamlCol = utf8.RuneCountInString(previous)
+			e.yamlLines[e.yamlRow-1] = previous + line
+			e.yamlLines = append(e.yamlLines[:e.yamlRow], e.yamlLines[e.yamlRow+1:]...)
+			e.yamlRow--
+		}
+	case "delete":
+		line := e.yamlLines[e.yamlRow]
+		if e.yamlCol < utf8.RuneCountInString(line) {
+			e.yamlLines[e.yamlRow] = deleteRuneAt(line, e.yamlCol)
+		} else if e.yamlRow < len(e.yamlLines)-1 {
+			e.yamlLines[e.yamlRow] = line + e.yamlLines[e.yamlRow+1]
+			e.yamlLines = append(e.yamlLines[:e.yamlRow+1], e.yamlLines[e.yamlRow+2:]...)
+		}
+	case "enter":
+		line := []rune(e.yamlLines[e.yamlRow])
+		if e.yamlCol > len(line) {
+			e.yamlCol = len(line)
+		}
+		before, after := string(line[:e.yamlCol]), string(line[e.yamlCol:])
+		e.yamlLines[e.yamlRow] = before
+		tail := append([]string{after}, e.yamlLines[e.yamlRow+1:]...)
+		e.yamlLines = append(e.yamlLines[:e.yamlRow+1], tail...)
+		e.yamlRow++
+		e.yamlCol = 0
+	case "tab":
+		e.yamlLines[e.yamlRow] = insertAtRune(e.yamlLines[e.yamlRow], e.yamlCol, "  ")
+		e.yamlCol += 2
+	default:
+		if len(runes) > 0 {
+			text := string(runes)
+			e.yamlLines[e.yamlRow] = insertAtRune(e.yamlLines[e.yamlRow], e.yamlCol, text)
+			e.yamlCol += utf8.RuneCountInString(text)
+		}
+	}
+	e.yamlClampCol()
+	return m, nil
 }
 
 func firstSelectedRoute(routes []config.NetworkRoute) int {
@@ -2023,6 +2475,40 @@ func (m appModel) nextLogMessage() tea.Cmd {
 	}
 }
 
+// updateSudoPassword drives the sudo authorization modal: enter submits a
+// non-empty password, esc/ctrl+c cancel with an empty reply. Replies go
+// directly (the channel is buffered) so a timed-out asker can't wedge the
+// UI.
+func (m appModel) updateSudoPassword(key string, message tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key {
+	case "esc", "ctrl+c":
+		if m.sudoPrompt.authenticate {
+			m.sudoPending = nil
+			m.sudo = sudoMissing
+			m.setError("sudo authorization cancelled")
+		} else {
+			m.sudoPrompt.request.Reply <- ""
+		}
+		m.sudoPrompt = nil
+		return m, nil
+	case "enter":
+		value := m.sudoPrompt.input.Value()
+		if strings.TrimSpace(value) == "" {
+			return m, nil
+		}
+		if m.sudoPrompt.authenticate {
+			m.sudoPrompt = nil
+			return m, m.authenticateSudoCmd(value)
+		}
+		m.sudoPrompt.request.Reply <- value
+		m.sudoPrompt = nil
+		return m, nil
+	}
+	var command tea.Cmd
+	m.sudoPrompt.input, command = m.sudoPrompt.input.Update(message)
+	return m, command
+}
+
 func (m appModel) updateLogs(key string) (tea.Model, tea.Cmd) {
 	if key == "esc" || key == "q" || key == "ctrl+c" {
 		m.logSession.Cancel()
@@ -2033,11 +2519,11 @@ func (m appModel) updateLogs(key string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	visibleLines := filterAndHighlightLines(m.logLines, m.searchQuery(searchLogs))
-	visible := max(m.chrome().Budget(m.height), 1)
+	visible := max(m.chrome().Budget(m.height, m.width), 1)
 	switch key {
-	case "up":
+	case "up", "k":
 		m.logOffset = min(m.logOffset+1, max(len(visibleLines)-visible, 0))
-	case "down":
+	case "down", "j":
 		m.logOffset = max(m.logOffset-1, 0)
 	case "pgup":
 		m.logOffset = min(m.logOffset+visible, max(len(visibleLines)-visible, 0))
@@ -2056,7 +2542,7 @@ func actionLabel(action string) string {
 
 func (m appModel) openConnection(name string) (tea.Model, tea.Cmd) {
 	if m.options.LoadDetail == nil {
-		m.errorMsg = "connection details are unavailable"
+		m.setError("connection details are unavailable")
 		return m, nil
 	}
 	m.loadingDetail = name
@@ -2125,21 +2611,21 @@ func (m appModel) updateShell(key string, runes []rune) (tea.Model, tea.Cmd) {
 		m.shellInput = ""
 		return m, nil
 	case "backspace":
-		if n := len(m.shellInput); n > 0 {
-			m.shellInput = m.shellInput[:n-1]
+		input := []rune(m.shellInput)
+		if len(input) > 0 {
+			m.shellInput = string(input[:len(input)-1])
 		}
 		return m, nil
 	case "tab":
 		matches := m.matchingCommands()
 		if len(matches) > 0 {
-			m.shellIndex++
-			m.shellInput = matches[m.shellIndex%len(matches)] + " "
+			m.shellInput = matches[0] + " "
 		}
 		return m, nil
 	case "enter":
 		outcome, err := ParseShell(m.shellInput, m.currentName(), m.connectionNames())
 		if err != nil {
-			m.errorMsg = err.Error()
+			m.setError(err.Error())
 			return m, nil
 		}
 		if outcome.Quit {
@@ -2148,12 +2634,12 @@ func (m appModel) updateShell(key string, runes []rune) (tea.Model, tea.Cmd) {
 		}
 		if outcome.Action == "" {
 			// help / bare command name: stay in the app, list the options.
-			m.errorMsg = "commands: " + strings.Join(shellCommands, ", ")
+			m.setError("commands: " + strings.Join(shellCommands, ", "))
 			return m, nil
 		}
 		return m.requestAction(outcome.Action, outcome.Connection, outcome.View)
 	}
-	// Any unhandled key carrying runes (bubbletea normalizes printable
+	// Any unhandled key carrying runes (the runtime normalizes printable
 	// characters this way) extends the command line.
 	if len(runes) > 0 {
 		m.shellInput += string(runes)
@@ -2169,30 +2655,39 @@ func (m appModel) connectionNames() []string {
 	return names
 }
 
-// matchingCommands returns the command words matching the current input, for
-// tab completion and the footer suggestion line.
+// matchingCommands returns complete command lines matching the current input.
 func (m appModel) matchingCommands() []string {
-	token := strings.Fields(m.shellInput)
-	if len(token) > 1 {
-		if token[0] == "dns" {
-			return []string{"dns install", "dns remove", "dns edit"}
+	input := m.shellInput
+	candidates := append([]string(nil), shellCommands...)
+	candidates = append(candidates, m.connectionNames()...)
+	if strings.ContainsAny(input, " \t") {
+		candidates = nil
+		fields := strings.Fields(input)
+		if len(fields) == 0 {
+			return nil
 		}
-		return shellCommands
+		if fields[0] == "dns" {
+			for _, action := range []string{"install", "remove", "edit"} {
+				command := "dns " + action
+				candidates = append(candidates, command)
+				for _, name := range m.connectionNames() {
+					candidates = append(candidates, command+" "+name)
+				}
+			}
+		} else {
+			switch fields[0] {
+			case "start", "stop", "launch", "logs", "status", "print", "rescan", "forget":
+				for _, name := range m.connectionNames() {
+					candidates = append(candidates, fields[0]+" "+name)
+				}
+			}
+		}
 	}
-	prefix := strings.TrimSpace(m.shellInput)
 	var matches []string
-	for _, command := range shellCommands {
-		if strings.HasPrefix(command, prefix) {
-			matches = append(matches, command)
+	for _, candidate := range candidates {
+		if strings.HasPrefix(strings.ToLower(candidate), strings.ToLower(input)) {
+			matches = append(matches, candidate)
 		}
-	}
-	for _, name := range m.connectionNames() {
-		if strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
-			matches = append(matches, name)
-		}
-	}
-	if len(matches) == 0 {
-		return shellCommands
 	}
 	return matches
 }
@@ -2281,6 +2776,248 @@ func ParseShell(input string, current string, names []string) (Outcome, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Home dashboard
+// ---------------------------------------------------------------------------
+
+// The dashboard is the persistent k9s-style header above the connections
+// table: metadata on the left, keybindings in the middle, and the wordmark on
+// the right. Unlike a startup splash it stays on screen with the table.
+var (
+	dashboardMetaLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
+	dashboardMetaValueStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+	dashboardKeyStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+	dashboardKeyLabelStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+	dashboardLogoStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("208"))
+)
+
+// dashboardLogoWord is the wordmark shown at the left of the top bar.
+var dashboardLogoWord = "BASTIONCTL"
+
+type dashboardMetaRow struct{ Label, Value string }
+
+// dashboardSelection is the connection summarized in the dashboard.
+func (m appModel) dashboardSelection() (ConnSummary, bool) {
+	if m.level() == 0 {
+		summaries := m.visibleSummaries()
+		if cursor := m.home.Cursor(); cursor >= 0 && cursor < len(summaries) {
+			return summaries[cursor], true
+		}
+		return ConnSummary{}, false
+	}
+	name := m.currentName()
+	if name != "" {
+		summaries := m.visibleSummaries()
+		if cursor := m.home.Cursor(); cursor >= 0 && cursor < len(summaries) && summaries[cursor].Name == name {
+			return summaries[cursor], true
+		}
+		for _, summary := range m.options.Summaries {
+			if summary.Name == name {
+				return summary, true
+			}
+		}
+	}
+	if index := m.options.Highlight; index >= 0 && index < len(m.options.Summaries) {
+		return m.options.Summaries[index], true
+	}
+	return ConnSummary{}, false
+}
+
+func (m appModel) dashboardMetaRows() []dashboardMetaRow {
+	profile := m.options.Profile
+	if profile == "" {
+		profile = "default"
+	}
+	running := 0
+	for _, summary := range m.options.Summaries {
+		if summary.Running {
+			running++
+		}
+	}
+	rows := []dashboardMetaRow{
+		{"Profile", profile},
+		{"Connections", fmt.Sprintf("%d saved · %d running", len(m.options.Summaries), running)},
+	}
+	selected, hasSelection := m.dashboardSelection()
+	account := m.options.Account
+	if hasSelection && selected.Account != "" {
+		account = selected.Account
+		if label := m.options.AccountLabels[selected.Account]; label != "" {
+			account = label
+		}
+	}
+	if account == "" {
+		for _, summary := range m.options.Summaries {
+			if summary.Account != "" {
+				account = "—"
+				break
+			}
+		}
+	}
+	if account != "" {
+		rows = append(rows, dashboardMetaRow{"Account", account})
+	}
+	if summary, ok := selected, hasSelection; ok {
+		rows = append(rows, dashboardMetaRow{"Selected", summary.Name})
+		method := summary.Method
+		if method == "" {
+			method = "—"
+		}
+		if summary.Region != "" {
+			method += " · " + summary.Region
+		}
+		rows = append(rows, dashboardMetaRow{"Method", method})
+		dns := summary.DNS
+		if dns == "" {
+			dns = "off"
+		}
+		rows = append(rows, dashboardMetaRow{"DNS", dns})
+	} else {
+		rows = append(rows, dashboardMetaRow{"Selected", "—"}, dashboardMetaRow{"Method", "—"}, dashboardMetaRow{"DNS", "—"})
+	}
+	if m.options.Offline {
+		rows = append(rows, dashboardMetaRow{"Mode", "offline · cached"})
+	}
+	version := m.options.Version
+	if version == "" {
+		version = "dev"
+	}
+	rows = append(rows, dashboardMetaRow{"Bastionctl", version})
+	return rows
+}
+
+func padRight(s string, width int) string {
+	if gap := width - lipgloss.Width(s); gap > 0 {
+		return s + strings.Repeat(" ", gap)
+	}
+	return s
+}
+
+// renderDashboardMeta renders the metadata block. valueCap bounds the value
+// column so a long label cannot overflow the terminal; the caller normally
+// passes the full available width so nothing is cut short.
+func renderDashboardMeta(m appModel, valueCap int) string {
+	rows := m.dashboardMetaRows()
+	labelWidth := 0
+	for _, row := range rows {
+		labelWidth = max(labelWidth, lipgloss.Width(row.Label))
+	}
+	valueWidth := 0
+	for _, row := range rows {
+		valueWidth = max(valueWidth, lipgloss.Width(row.Value))
+	}
+	valueWidth = min(valueWidth, max(valueCap-labelWidth-2, 1))
+	lines := make([]string, len(rows))
+	for index, row := range rows {
+		label := dashboardMetaLabelStyle.Render(padRight(row.Label, labelWidth))
+		value := dashboardMetaValueStyle.Render(truncate(row.Value, valueWidth))
+		lines[index] = label + "  " + value
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderDashboardLines returns the persistent connection metadata rows.
+func renderDashboardLines(m appModel, width int) []string {
+	if width <= 0 {
+		width = 80
+	}
+	meta := renderDashboardMeta(m, max(width-2, 20))
+	rows := strings.Split(meta, "\n")
+	out := make([]string, len(rows))
+	for index, row := range rows {
+		out[index] = " " + row
+	}
+	return out
+}
+
+// dashboardMinWidth/dashboardMinHeight keep the header from crowding out the
+// table on small terminals; below them the compact chrome header is used.
+const (
+	dashboardMinWidth  = 60
+	dashboardMinHeight = 16
+)
+
+func (m appModel) dashboardEligible() bool {
+	if m.width < dashboardMinWidth {
+		return false
+	}
+	if m.height < dashboardMinHeight {
+		return false
+	}
+	return true
+}
+
+// dashboardActive reports whether the current view shows connection metadata.
+func (m appModel) dashboardActive() bool {
+	return m.dashboardEligible()
+}
+
+// homeTableWidth is the table width inside the home panel.
+func (m appModel) homeTableWidth() int {
+	width := m.width
+	if width <= 0 {
+		width = 120
+	}
+	if m.level() == 0 {
+		return max(width-2, 20)
+	}
+	return width
+}
+
+// homeTableTitle is the label embedded in the table panel's top border,
+// e.g. connections(all)[6].
+func (m appModel) homeTableTitle() string {
+	filter := "all"
+	if query := strings.TrimSpace(m.searchQuery(searchHome)); query != "" {
+		filter = query
+	}
+	return fmt.Sprintf("connections(%s)[%d]", filter, len(m.visibleSummaries()))
+}
+
+var (
+	tablePanelBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	tablePanelTitleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+)
+
+// renderPanel wraps content in the k9s-style bordered panel with a title in
+// the top border. height is the number of inner rows; the panel adds the two
+// border rows. Every screen uses this frame so panels share one look.
+func renderPanel(content string, width, height int, title string) string {
+	width = max(width, 4)
+	inner := width - 2
+	title = truncate(title, max(inner-2, 1))
+	rules := max(inner-lipgloss.Width(title)-2, 0)
+	leftRules := rules / 2
+	rightRules := rules - leftRules
+	top := tablePanelBorderStyle.Render("┌"+strings.Repeat("─", leftRules)+" ") +
+		tablePanelTitleStyle.Render(title) +
+		tablePanelBorderStyle.Render(" "+strings.Repeat("─", rightRules)+"┐")
+	if inner < 3 {
+		top = tablePanelBorderStyle.Render("┌" + strings.Repeat("─", inner) + "┐")
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if height > 0 {
+		if len(lines) > height {
+			lines = lines[:height]
+		}
+		for len(lines) < height {
+			lines = append(lines, "")
+		}
+	}
+	out := make([]string, 0, len(lines)+2)
+	out = append(out, top)
+	for _, line := range lines {
+		out = append(out, tablePanelBorderStyle.Render("│")+padCell(line, inner)+tablePanelBorderStyle.Render("│"))
+	}
+	out = append(out, tablePanelBorderStyle.Render("└"+strings.Repeat("─", inner)+"┘"))
+	return strings.Join(out, "\n")
+}
+
+// renderTablePanel is the home table's panel.
+func renderTablePanel(table string, width, height int, title string) string {
+	return renderPanel(table, width, height, title)
+}
+
+// ---------------------------------------------------------------------------
 // Views
 // ---------------------------------------------------------------------------
 
@@ -2293,46 +3030,94 @@ func (m appModel) View() string {
 }
 
 func (m appModel) body() string {
-	budget := m.chrome().Budget(m.height)
-	if m.logSession != nil {
-		query := m.searchQuery(searchLogs)
-		lines := filterAndHighlightLines(m.logLines, query)
-		if len(lines) == 0 && len(m.logLines) > 0 && query != "" {
-			return "No log lines match " + query
-		}
-		return renderLogView(lines, m.logOffset, budget, m.logDone, m.logError)
+	budget := m.chrome().Budget(m.height, m.width)
+	// Every screen body sits inside the same bordered panel, so renderers
+	// get two fewer rows and two fewer columns.
+	frameWidth := m.width
+	if frameWidth <= 0 {
+		frameWidth = 80
 	}
+	innerBudget := budget
+	panelHeight := 0
+	if budget != maxInt {
+		innerBudget = max(budget-2, 1)
+		panelHeight = innerBudget
+	}
+	innerWidth := max(frameWidth-2, 4)
+
 	var base string
 	switch {
+	case m.logSession != nil:
+		query := m.searchQuery(searchLogs)
+		lines := filterAndHighlightLines(m.logLines, query)
+		content := ""
+		if len(lines) == 0 && len(m.logLines) > 0 && query != "" {
+			content = "No log lines match " + query
+		} else {
+			content = renderLogView(lines, m.logOffset, innerBudget, m.logDone, m.logError)
+		}
+		title := m.logTitle
+		if title == "" {
+			title = "logs(" + m.currentName() + ")"
+		}
+		base = renderPanel(content, frameWidth, panelHeight, title)
 	case m.newWizard != nil:
-		base = renderNewWizard(m.newWizard, budget, m.width, m.searchQuery(m.activeSearchScope()))
+		content := renderNewWizard(m.newWizard, innerBudget, innerWidth, m.searchQuery(m.activeSearchScope()))
+		base = renderPanel(content, frameWidth, panelHeight, "new connection · "+m.newWizard.step)
 	case m.rescan != nil:
-		base = renderRescanPicker(m.rescan, budget, m.width, m.searchQuery(searchRescan))
+		content := renderRescanPicker(m.rescan, innerBudget, innerWidth, m.searchQuery(searchRescan))
+		base = renderPanel(content, frameWidth, panelHeight, "rescan("+m.rescan.connection+")")
 	case m.editor != nil:
 		scope := searchEditor
 		if len(m.editor.choices) > 0 {
 			scope = searchEditorChoices
 		}
-		base = renderEditor(m.editor, budget, m.searchQuery(scope))
+		title := "edit(" + m.editor.originalName + ")"
+		if m.editor.isNew {
+			title = "new connection"
+		}
+		if m.editor.yamlMode {
+			title = "yaml · " + m.editor.originalName
+		}
+		var content string
+		switch {
+		case m.editor.yamlMode:
+			content = renderYAMLEditor(m.editor, innerBudget, innerWidth)
+		case m.width >= editorSplitMinWidth:
+			content = renderEditorSplit(m.editor, innerBudget, innerWidth, m.searchQuery(scope))
+		default:
+			content = renderEditor(m.editor, innerBudget, m.searchQuery(scope), innerWidth)
+		}
+		base = renderPanel(content, frameWidth, panelHeight, title)
 	case m.level() == 1:
-		base = renderFilteredDetailCard(m.options.Detail, budget, m.searchQuery(searchDetail))
+		content := renderFilteredDetailCard(m.options.Detail, innerBudget, m.searchQuery(searchDetail))
+		name := "connection"
+		if m.options.Detail != nil && m.options.Detail.Name != "" {
+			name = "connection(" + m.options.Detail.Name + ")"
+		}
+		base = renderPanel(content, frameWidth, panelHeight, name)
 	case m.width == 0:
 		// First frame, before the terminal size arrives.
 		base = ""
 	default:
-		// Table photos: the table renders its own header line on top of
-		// the height rows, so reserve one line for it.
-		m.home.SetHeight(max(budget-1, 3))
-		base = m.home.View()
+		m.home.SetHeight(max(innerBudget, 2))
+		base = renderPanel(m.home.View(), frameWidth, panelHeight, m.homeTableTitle())
 	}
-	if (m.help || m.actionModal != nil) && budget != maxInt {
+	if (m.help || m.actionModal != nil || m.sudoPrompt != nil) && budget != maxInt {
 		lines := strings.Count(base, "\n") + 1
 		if lines < budget {
 			base += strings.Repeat("\n", budget-lines)
 		}
 	}
 	if m.help {
-		return overlayCenter(base, helpPanel(m.width, budget), m.width)
+		return overlayCenter(base, helpPanel(m.width, budget, m.editor != nil), m.width)
+	}
+	if m.sudoPrompt != nil {
+		return overlayCenter(base, renderSudoPasswordModal(m.sudoPrompt, m.width, budget), m.width)
+	}
+	if m.editor != nil && m.editor.discardConfirm {
+		modal := &actionModal{title: "Discard unsaved changes?", body: "y discard · n keep editing", running: true}
+		return overlayCenter(base, renderActionModal(modal, m.width, budget), m.width)
 	}
 	if m.actionModal != nil {
 		return overlayCenter(base, renderActionModal(m.actionModal, m.width, budget), m.width)
@@ -2341,7 +3126,6 @@ func (m appModel) body() string {
 }
 
 func renderNewWizard(wizard *newConnectionWizard, budget, width int, query string) string {
-	title := "NEW CONNECTION · " + strings.ToUpper(wizard.step)
 	var rows []string
 	var indices []int
 	switch wizard.step {
@@ -2357,9 +3141,9 @@ func renderNewWizard(wizard *newConnectionWizard, budget, width int, query strin
 		indices = matchingNewRoutes(wizard, query)
 	}
 	if budget <= 0 || budget == maxInt {
-		budget = len(indices) + 3
+		budget = len(indices) + 2
 	}
-	rowBudget := max(budget-3, 1)
+	rowBudget := max(budget-2, 1)
 	position := indexOf(indices, wizard.cursor)
 	if position < 0 && len(indices) > 0 {
 		position = 0
@@ -2370,7 +3154,6 @@ func renderNewWizard(wizard *newConnectionWizard, budget, width int, query strin
 	}
 	end := min(start+rowBudget, len(indices))
 	lines := []string{
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render(title),
 		chromeDimStyle.Render("↑/↓ select · enter continue · esc cancel · / search"),
 		"",
 	}
@@ -2402,7 +3185,7 @@ func renderNewWizard(wizard *newConnectionWizard, budget, width int, query strin
 		}
 		row := truncate(marker+text, max(width-2, 1))
 		if index == wizard.cursor {
-			row = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("10")).Render(row)
+			row = selectionStyle.Render(row)
 		} else {
 			row = highlightText(row, query)
 		}
@@ -2416,7 +3199,7 @@ func renderRescanPicker(selector *rescanSelector, budget, width int, query strin
 		budget = len(selector.candidates) + 3
 	}
 	indices := matchingRescanCandidates(selector, query)
-	rowBudget := max(budget-3, 1)
+	rowBudget := max(budget-2, 1)
 	position := indexOf(indices, selector.cursor)
 	if position < 0 && len(indices) > 0 {
 		position = 0
@@ -2427,7 +3210,6 @@ func renderRescanPicker(selector *rescanSelector, budget, width int, query strin
 	}
 	end := min(start+rowBudget, len(indices))
 	lines := []string{
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("SELECT NEW PIVOT · " + selector.connection),
 		chromeDimStyle.Render("The current pivot is marked · enter save · esc cancel"),
 		"",
 	}
@@ -2456,7 +3238,7 @@ func renderRescanPicker(selector *rescanSelector, budget, width int, query strin
 		row := fmt.Sprintf("%s%s  %s  %s · %s", marker, name+current, candidate.InstanceID, candidate.Method, egress)
 		row = truncate(row, max(width-2, 1))
 		if index == selector.cursor {
-			row = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("10")).Render(row)
+			row = selectionStyle.Render(row)
 		}
 		lines = append(lines, row)
 	}
@@ -2500,19 +3282,144 @@ func highlightText(text, query string) string {
 	return matcher.ReplaceAllStringFunc(text, func(match string) string { return style.Render(match) })
 }
 
-func renderEditor(editor *connectionEditor, budget int, query string) string {
+// editorSplitMinWidth is the narrowest terminal that shows the field editor
+// and the YAML preview side by side. Narrower terminals keep the full-width
+// field editor; ctrl+y still opens the YAML editor.
+const editorSplitMinWidth = 90
+
+// padCell truncates s to width display cells and pads it with spaces so the
+// next column starts at a fixed offset.
+func padCell(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	s = truncate(s, width)
+	if gap := width - lipgloss.Width(s); gap > 0 {
+		return s + strings.Repeat(" ", gap)
+	}
+	return s
+}
+
+// colorizeYAMLLine highlights YAML tokens in a preview line.
+func colorizeYAMLLine(line string) string {
+	return renderVimLine(line, -1, false, true, 0)
+}
+
+// renderEditorSplit composes the field editor and a read-only YAML preview
+// side by side, separated by a vertical rule.
+func renderEditorSplit(editor *connectionEditor, budget, width int, query string) string {
+	leftWidth := width * 3 / 5
+	leftWidth = max(min(leftWidth, width-28), 44)
+	rightWidth := max(width-leftWidth-1, 1)
+	left := strings.Split(renderEditor(editor, budget, query, leftWidth), "\n")
+	right := strings.Split(renderYAMLPreview(editor, budget), "\n")
+	rows := max(len(left), len(right))
+	if budget > 0 && budget != maxInt {
+		rows = min(rows, budget)
+	}
+	separator := chromeDimStyle.Render("│")
+	lines := make([]string, 0, rows)
+	for index := 0; index < rows; index++ {
+		leftLine, rightLine := "", ""
+		if index < len(left) {
+			leftLine = left[index]
+		}
+		if index < len(right) {
+			rightLine = right[index]
+		}
+		lines = append(lines, padCell(leftLine, leftWidth)+separator+padCell(rightLine, rightWidth))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderYAMLPreview renders the live draft as YAML. Invalid drafts (e.g. a
+// half-typed SSH port) show the validation error instead of a document.
+func renderYAMLPreview(editor *connectionEditor, budget int) string {
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("YAML PREVIEW"),
+		chromeDimStyle.Render("ctrl+y edit"),
+	}
+	document, err := editorYAMLDocument(editor)
+	if err != nil {
+		return strings.Join(append(lines, chromeErrStyle.Render(err.Error())), "\n")
+	}
+	body := strings.Split(strings.TrimRight(document, "\n"), "\n")
+	total := len(body)
+	limit := budget - len(lines)
+	if budget <= 0 || budget == maxInt {
+		limit = total
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	truncated := total > limit
+	if truncated {
+		body = body[:limit]
+	}
+	for _, line := range body {
+		lines = append(lines, colorizeYAMLLine(line))
+	}
+	if truncated {
+		lines[len(lines)-1] = chromeDimStyle.Render(fmt.Sprintf("… %d more lines", total-limit))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderYAMLEditor renders the inline YAML editor with a scrolling viewport.
+func renderYAMLEditor(editor *connectionEditor, budget, width int) string {
+	mode := "NORMAL"
+	if editor.vimInsert {
+		mode = "INSERT"
+	}
+	lines := []string{
+		chromeDimStyle.Render(mode + " · :w save · :q close"),
+	}
+	reserve := 0
+	if editor.yamlError != "" {
+		reserve = 1
+	}
+	rows := budget - len(lines) - reserve
+	if budget <= 0 || budget == maxInt {
+		rows = len(editor.yamlLines)
+	}
+	if rows < 1 {
+		rows = 1
+	}
+	if editor.yamlRow < editor.yamlOffset {
+		editor.yamlOffset = editor.yamlRow
+	}
+	if editor.yamlRow >= editor.yamlOffset+rows {
+		editor.yamlOffset = editor.yamlRow - rows + 1
+	}
+	if editor.yamlOffset < 0 {
+		editor.yamlOffset = 0
+	}
+	end := min(editor.yamlOffset+rows, len(editor.yamlLines))
+	for index := editor.yamlOffset; index < end; index++ {
+		cursor := -1
+		if index == editor.yamlRow {
+			cursor = editor.yamlCol
+		}
+		lines = append(lines, renderVimLine(editor.yamlLines[index], cursor, editor.vimInsert, true, max(width, 1)))
+	}
+	if editor.yamlError != "" {
+		lines = append(lines, chromeErrStyle.Render(truncate(editor.yamlError, max(width, 1))))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderEditor(editor *connectionEditor, budget int, query string, widths ...int) string {
 	if editor.routePicker {
 		indices := matchingEditorRoutes(editor.routes, query)
 		if budget <= 0 || budget == maxInt {
-			budget = len(indices) + 3
+			budget = len(indices) + 2
 		}
 		lines := []string{
-			lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("SELECT ROUTES · " + editor.originalName),
 			chromeDimStyle.Render("↑/↓ move · space toggle · a all · m add CIDR · enter apply · esc discard"),
 			"",
 		}
 		if editor.addingRoute {
-			lines = append(lines, "Additional CIDR: "+editor.routeInput+"▏")
+			lines = append(lines, "Additional CIDR: "+editor.routeInput+"|")
 			if editor.routeError != "" {
 				lines = append(lines, chromeErrStyle.Render(editor.routeError))
 			}
@@ -2540,7 +3447,7 @@ func renderEditor(editor *connectionEditor, budget int, query string) string {
 			}
 			row := fmt.Sprintf("%s %s · %s · %s", checked, route.CIDR, route.Source, route.Description)
 			if index == editor.routeCursor {
-				row = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("10")).Render("▶ " + highlightText(row, query))
+				row = selectionStyle.Render("▶ " + highlightText(row, query))
 			} else {
 				row = highlightText(row, query)
 			}
@@ -2550,7 +3457,6 @@ func renderEditor(editor *connectionEditor, budget int, query string) string {
 	}
 	if len(editor.choices) > 0 {
 		lines := []string{
-			lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("SELECT " + strings.ToUpper(editor.fields[editor.field])),
 			chromeDimStyle.Render("↑/↓ move · enter select · esc cancel"),
 			"",
 		}
@@ -2568,14 +3474,14 @@ func renderEditor(editor *connectionEditor, budget int, query string) string {
 			choice := editor.choices[index]
 			row := "  " + choice
 			if index == editor.choiceCursor {
-				row = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("10")).Render("▶ " + choice)
+				row = selectionStyle.Render("▶ " + choice)
 			}
 			lines = append(lines, row)
 		}
 		return strings.Join(lines, "\n")
 	}
 	if budget <= 0 || budget == maxInt {
-		budget = len(editor.fields) + 4
+		budget = len(editor.fields) + 3
 	}
 	indices := matchingEditorFields(editor, query)
 	if len(indices) == 0 {
@@ -2585,31 +3491,38 @@ func renderEditor(editor *connectionEditor, budget int, query string) string {
 	if activePosition < 0 {
 		activePosition = 0
 	}
-	fieldRows := max(budget-4, 1)
+	fieldRows := max(budget-3, 1)
 	start := max(activePosition-fieldRows+1, 0)
 	if lastStart := max(len(indices)-fieldRows, 0); start > lastStart {
 		start = lastStart
 	}
 	end := min(start+fieldRows, len(indices))
 	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	active := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("10"))
+	active := selectionStyle
+	mode := "NORMAL"
+	if editor.vimInsert {
+		mode = "INSERT"
+	}
+	width := 0
+	if len(widths) > 0 {
+		width = max(widths[0]-19, 1)
+	}
 	lines := []string{
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("EDIT CONNECTION · " + editor.originalName),
-		muted.Render(fmt.Sprintf("Field %d/%d · %s", editor.field+1, len(editor.fields), editor.fields[editor.field])),
-		muted.Render("↑/↓ or tab move · enter options/next · ctrl+s save · esc cancel"),
+		muted.Render(fmt.Sprintf("%s · Field %d/%d · %s", mode, editor.field+1, len(editor.fields), editor.fields[editor.field])),
+		muted.Render("j/k move · i insert · enter options · ctrl+y yaml · :w save"),
 		"",
 	}
 	if editor.conflicted {
-		lines[1] = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("1")).Render("Changed on disk · Esc to cancel and reopen")
+		lines[0] = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("1")).Render("Changed on disk · Esc to cancel and reopen")
 	}
 	for position := start; position < end; position++ {
 		i := indices[position]
-		text := fmt.Sprintf("%-16s %s", editor.fields[i], editor.values[i])
+		value := editor.values[i]
 		if i == editor.field {
-			text += "▏"
-			lines = append(lines, active.Render("▶ "+highlightText(text, query)))
+			label := active.Render(fmt.Sprintf("▶ %-16s", editor.fields[i]))
+			lines = append(lines, label+" "+renderVimLine(value, editor.cursor, editor.vimInsert, false, width))
 		} else {
-			lines = append(lines, "  "+highlightText(text, query))
+			lines = append(lines, "  "+highlightText(fmt.Sprintf("%-16s %s", editor.fields[i], value), query))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -2711,6 +3624,23 @@ func renderLogView(lines []string, offset, budget int, done bool, err error) str
 	return strings.Join(visible, "\n")
 }
 
+// renderSudoPasswordModal draws the in-app sudo authorization popup: the
+// reason line (which attempt, what failed last), a masked input, and the
+// key hints. Touch ID never goes through here — sudo's PAM chain handles
+// it before the typed-password fallback fires.
+func renderSudoPasswordModal(prompt *sudoPasswordPrompt, width, height int) string {
+	innerWidth := min(max(width-8, 24), 78)
+	lines := []string{lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("Sudo authorization")}
+	for _, line := range strings.Split(strings.TrimSpace(prompt.request.Reason), "\n") {
+		lines = append(lines, truncate(chromeDimStyle.Render(line), innerWidth))
+	}
+	lines = append(lines, "", "Password: "+prompt.input.View(), "", chromeDimStyle.Render("enter submit · esc cancel"))
+	if height > 2 && len(lines) > height-2 {
+		lines = lines[:height-2]
+	}
+	return helpBorderStyle.Render(strings.Join(lines, "\n"))
+}
+
 func renderActionModal(modal *actionModal, width, height int) string {
 	innerWidth := min(max(width-8, 24), 78)
 	lines := []string{lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render(modal.title)}
@@ -2732,13 +3662,41 @@ func renderActionModal(modal *actionModal, width, height int) string {
 
 // helpPanel renders the `?` window content inside a rounded border,
 // capped to the body budget.
-func helpPanel(width, height int) string {
+func helpPanel(width, height int, editing bool) string {
 	lines := helpPanelLines(width)
+	if editing {
+		lines = editorHelpPanelLines(width)
+	}
 	// Account for the two border rows.
 	if height > 2 && len(lines) > height-2 {
 		lines = lines[:height-2]
 	}
 	return helpBorderStyle.Render(strings.Join(lines, "\n"))
+}
+
+func editorHelpPanelLines(width int) []string {
+	inner := max(min(width-6, 78), 1)
+	lines := []string{
+		"Editor",
+		"j/k or arrows    move between fields or lines",
+		"h/l or arrows    move cursor",
+		"i / a            insert before / after cursor",
+		"o / x / dd       new line / delete character / line",
+		"u                undo",
+		"ctrl+o           return to normal mode",
+		"esc              return; confirm unsaved changes",
+		"enter            choose options",
+		"ctrl+y           edit YAML",
+		"/                search fields or YAML",
+		":w / ctrl+s      save to disk",
+		":wq              save and close",
+		":q / :q!         close / discard unsaved changes",
+		"v                check AWS profile",
+	}
+	for index := range lines {
+		lines[index] = truncate(lines[index], inner)
+	}
+	return lines
 }
 
 // helpPanelLines assembles the navigation / action / shell reference rows
@@ -2759,23 +3717,17 @@ func helpPanelLines(width int) []string {
 	}
 	return []string{
 		section("Navigation"),
-		row("↑/↓ · pgup/pgdn", "move · page the selection"),
-		row("enter", "open the highlighted connection"),
-		row("esc", "back (quits from the home screen)"),
-		row("/", "filter connections · enter apply · esc cancel"),
-		row(":", "commands or :<connection> shortcut · tab completes"),
+		row("j/k · ↑/↓", "move the selection · pgup/pgdn page"),
+		row("enter · esc", "open · go back"),
+		row("/ · :", "filter (esc clears) · commands (tab completes)"),
 		row("?", "toggle this help · q quits"),
 		section("Actions — home"),
-		row("n", "new connection (needs AWS)"),
-		row("s · x", "start · stop the tunnel"),
-		row("l · i", "live logs · status"),
+		row("n · s · x", "new (needs AWS) · start · stop"),
+		row("a · l · i", "launch · live logs · status"),
 		row("d · e · v", "DNS · edit connection · check AWS"),
 		row("r · f", "rescan · forget"),
-		row("a", "launch the tunnel in the foreground"),
 		section("Actions — connection view"),
-		row("p", "print the exact sshuttle command"),
-		row("1 · 2", "install · remove the split-DNS resolver"),
-		row("d · e · v", "DNS · edit connection · check AWS"),
+		row("p · 1 · 2", "print command · install/remove DNS resolver"),
 		section("Shell commands (:)"),
 		row("start|stop|…", "start, stop, launch, logs, status, print,"),
 		row("", "\trescan, forget — optional [connection]"),
@@ -2795,19 +3747,37 @@ func (m appModel) chrome() Chrome {
 		chrome = m.homeChrome()
 	}
 	if m.loadingDetail != "" {
-		chrome.Info = "loading " + m.loadingDetail + "…"
+		if len(chrome.Dashboard) > 0 {
+			chrome.Loading = "loading " + m.loadingDetail + "…"
+		} else {
+			chrome.Info = "loading " + m.loadingDetail + "…"
+		}
 	}
 	if m.editor != nil {
+		chrome.Title = "edit(" + m.editor.originalName + ")"
+		if m.editor.isNew {
+			chrome.Title = "new connection"
+		}
+		if m.editor.yamlMode {
+			chrome.Title = "yaml · " + m.editor.originalName
+		}
 		if m.editor.routePicker {
 			chrome.Hints = []Hint{{"↑/↓", "move"}, {"space", "toggle"}, {"a", "all"}, {"m", "add CIDR"}, {"enter", "apply"}, {"/", "search"}, {"esc", "discard"}}
+		} else if m.editor.yamlMode {
+			chrome.Hints = []Hint{{"i", "insert"}, {"ctrl+o", "normal"}, {"esc", "back"}, {":w", "save"}, {"/", "search"}, {"?", "help"}}
 		} else if len(m.editor.choices) > 0 {
 			chrome.Hints = []Hint{{"↑/↓", "choose"}, {"enter", "select"}, {"esc", "cancel"}}
 		} else {
-			chrome.Hints = []Hint{{"↑/↓", "move"}, {"tab", "next"}, {"enter", "options"}, {"ctrl+s", "save"}, {"v", "check access"}, {"esc", "cancel"}}
+			chrome.Hints = []Hint{{"j/k", "move"}, {"i", "insert"}, {"enter", "options"}, {"ctrl+y", "yaml"}, {"ctrl+o", "normal"}, {"esc", "back"}, {":w", "save"}, {"?", "help"}}
+		}
+		if m.editor.vimPrompt != "" {
+			chrome.ShellOpen = true
+			chrome.Shell = m.editor.vimInput
+			chrome.ShellPrefix = m.editor.vimPrompt
 		}
 	}
 	if m.newWizard != nil {
-		chrome.Title = "bastionctl · new connection"
+		chrome.Title = "new connection · " + m.newWizard.step
 		chrome.Info = m.newWizard.step
 		chrome.Hints = []Hint{{"↑/↓", "select"}, {"enter", "continue"}, {"/", "search"}, {"esc", "back"}}
 		if m.newWizard.step == "routes" {
@@ -2815,17 +3785,20 @@ func (m appModel) chrome() Chrome {
 		}
 	}
 	if m.rescan != nil {
-		chrome.Title = "bastionctl · rescan · " + m.rescan.connection
+		chrome.Title = "rescan · " + m.rescan.connection
 		chrome.Info = fmt.Sprintf("%d/%d candidates", m.rescan.cursor+1, len(m.rescan.candidates))
 		chrome.Hints = []Hint{{"↑/↓", "select pivot"}, {"enter", "save"}, {"esc", "cancel"}}
 	}
 	if m.logSession != nil {
-		chrome.Title = "bastionctl · " + m.logTitle
+		chrome.Title = m.logTitle
 		chrome.Info = "streaming"
 		if m.logDone {
 			chrome.Info = "ended"
 		}
-		chrome.Hints = []Hint{{"esc", "close"}, {"q", "close"}, {"↑/↓", "scroll"}, {"pgup/pgdn", "page"}}
+		chrome.Hints = []Hint{{"esc", "close"}, {"q", "close"}, {"j/k", "scroll"}, {"pgup/pgdn", "page"}}
+	}
+	if m.help {
+		chrome.Hints = []Hint{{"q", "close"}}
 	}
 	if m.options.SudoCheck != nil && m.sudo == sudoMissing {
 		if chrome.Info != "" {
@@ -2837,6 +3810,13 @@ func (m appModel) chrome() Chrome {
 		chrome.SearchOpen = true
 		chrome.Search = m.searchInput
 	}
+	home := m.homeChrome()
+	home.Dashboard = chrome.Dashboard
+	comparison := m
+	comparison.options.Detail = &ConnDetail{DNSWantsInstall: true}
+	connection := comparison.connectionChrome()
+	connection.Dashboard = chrome.Dashboard
+	chrome.MinHeaderRows = max(len(home.headerRows(m.width, m.height)), len(connection.headerRows(m.width, m.height)))
 	return chrome
 }
 
@@ -2874,14 +3854,17 @@ func (m appModel) homeChrome() Chrome {
 		{"?", "help"},
 		{"q", "quit"},
 	}
-	title := "bastionctl · connections"
-	if m.options.Account != "" {
-		title += " · " + m.options.Account
-	}
+	title := "connections"
 	if m.options.Profile != "" {
 		title += " · profile " + m.options.Profile
 	}
-	chrome := Chrome{Title: title, Info: info, Hints: hints, Error: m.errorMsg}
+	if m.options.Account != "" {
+		title += " · " + m.options.Account
+	}
+	chrome := Chrome{Title: title, Info: info, Hints: hints, Error: m.notice()}
+	if m.dashboardActive() {
+		chrome.Dashboard = renderDashboardLines(m, m.width)
+	}
 	if m.searching {
 		chrome.SearchOpen = true
 		chrome.Search = m.searchInput
@@ -2932,8 +3915,11 @@ func (m appModel) connectionChrome() Chrome {
 		last := hints[len(hints)-1]
 		hints = append(hints[:len(hints)-1], Hint{"1", "install"}, Hint{"2", "remove"}, Hint{"?", "help"}, last)
 	}
-	title := fmt.Sprintf("bastionctl · %s · %s/%s · %s", detail.Name, detail.Kind, detail.Method, detail.Region)
-	chrome := Chrome{Title: title, Info: info, Hints: hints, Error: m.errorMsg}
+	title := fmt.Sprintf("%s · %s/%s · %s", detail.Name, detail.Kind, detail.Method, detail.Region)
+	chrome := Chrome{Title: title, Info: info, Hints: hints, Error: m.notice()}
+	if m.dashboardActive() {
+		chrome.Dashboard = renderDashboardLines(m, m.width)
+	}
 	if m.shell {
 		chrome.ShellOpen = true
 		chrome.Shell = m.shellInput
@@ -3088,11 +4074,16 @@ type homeColSpec struct {
 func homeLayout(summaries []ConnSummary, width int) ([]table.Column, []table.Row) {
 	specs := []homeColSpec{
 		// Display order: essentials first, then metadata.
-		{title: "Status", cellOf: func(s ConnSummary) string { return s.StatusLabel() }, minW: 12, capW: 34, rank: 0},
+		{title: "Status", cellOf: func(s ConnSummary) string {
+			if s.Running && s.Stale {
+				return "◐ DNS missing"
+			}
+			return s.StatusLabel()
+		}, minW: 12, capW: 16, rank: 0},
 		{title: "Connection", cellOf: func(s ConnSummary) string { return s.Name }, minW: 12, capW: 28, rank: 0},
 		{title: "Region", cellOf: (func(s ConnSummary) string { return s.Region }), minW: 8, capW: 15, rank: 1},
 		{title: "AWS Profile", cellOf: func(s ConnSummary) string { return s.AWSProfileLabel() }, minW: 12, capW: 36, rank: 2},
-		{title: "DNS", cellOf: func(s ConnSummary) string { return s.DNS }, minW: 12, capW: 36, rank: 3},
+		{title: "DNS", cellOf: func(s ConnSummary) string { return s.DNS }, minW: 12, capW: 24, rank: 3},
 		{title: "Networks", cellOf: func(s ConnSummary) string { return s.Networks }, minW: 16, capW: 50, rank: 4},
 		{title: "Account", cellOf: func(s ConnSummary) string { return s.Account }, minW: 8, capW: 15, rank: 5},
 		{title: "Kind", cellOf: func(s ConnSummary) string { return s.Kind }, minW: 5, capW: 11, rank: 6},
@@ -3130,7 +4121,7 @@ func homeLayout(summaries []ConnSummary, width int) ([]table.Column, []table.Row
 		}
 	}
 	if used > width {
-		// Tiny terminal: even the essentials overflow; let bubbles
+		// Tiny terminal: even the essentials overflow; let the table
 		// truncate the rendered rows naturally.
 		for i := range specs {
 			specs[i].width = min(specs[i].width, max(width/2, specs[i].minW))

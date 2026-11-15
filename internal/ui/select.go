@@ -6,13 +6,13 @@ import (
 	"os"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/table"
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"golang.org/x/term"
 
 	"bastionctl/internal/config"
 	"bastionctl/internal/probe"
+	"bastionctl/internal/ui/table"
+	tea "bastionctl/internal/ui/tea"
 )
 
 type Choice struct {
@@ -33,15 +33,23 @@ type selectModel struct {
 
 var (
 	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
-	selectedStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("2"))
+	selectedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("#8598a7"))
+	selectionStyle   = selectedStyle
 	descriptionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	warningStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 )
 
-// listBudget keeps the legacy four-line reserve used by the scrollable
-// pickers (header, rule, rule, footer — see Chrome).
+// listBudget returns the shared chrome budget for unconstrained selectors.
 func listBudget(height int) int {
 	return Chrome{}.Budget(height)
+}
+
+func selectorBudget(chrome Chrome, height, width int) int {
+	budget := chrome.Budget(height, width)
+	if budget == maxInt {
+		return budget
+	}
+	return max(budget-2, 1)
 }
 
 // lineWindow slices [start,end) item indexes that fit budget lines and
@@ -143,18 +151,18 @@ func (m selectModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		default:
 			heights := selectItemHeights(m.choices)
-			m.start, _ = lineWindow(heights, m.cursor, m.start, listBudget(m.height))
+			m.start, _ = lineWindow(heights, m.cursor, m.start, selectorBudget(m.chrome(), m.height, m.width))
 			return m, nil
 		}
 	}
 	heights := selectItemHeights(m.choices)
-	m.start, _ = lineWindow(heights, m.cursor, m.start, listBudget(m.height))
+	m.start, _ = lineWindow(heights, m.cursor, m.start, selectorBudget(m.chrome(), m.height, m.width))
 	return m, nil
 }
 
 // pageStep is how far pgup/pgdn jump: the currently visible item count.
 func (m selectModel) pageStep() int {
-	budget := listBudget(m.height)
+	budget := selectorBudget(m.chrome(), m.height, m.width)
 	if budget == math.MaxInt {
 		return len(m.choices)
 	}
@@ -175,8 +183,9 @@ func (m selectModel) pageStep() int {
 
 func (m selectModel) chrome() Chrome {
 	return Chrome{
-		Title: m.title,
-		Info:  fmt.Sprintf("%d/%d", m.cursor+1, len(m.choices)),
+		Title:     m.title,
+		ShowTitle: true,
+		Info:      fmt.Sprintf("%d/%d", m.cursor+1, len(m.choices)),
 		Hints: []Hint{
 			{"↑/↓", "move"},
 			{"pgup/pgdn", "page"},
@@ -194,11 +203,14 @@ func (m selectModel) View() string {
 	var b strings.Builder
 	heights := selectItemHeights(m.choices)
 	if len(heights) > 0 {
-		start, end := lineWindow(heights, m.cursor, m.start, m.chrome().Budget(m.height))
+		start, end := lineWindow(heights, m.cursor, m.start, selectorBudget(m.chrome(), m.height, m.width))
 		b.WriteString(renderChoices(m.choices, m.cursor, start, end))
-		b.WriteString("\n")
 	}
-	return m.chrome().View(b.String(), width, m.height)
+	panelHeight := 0
+	if m.height > 0 {
+		panelHeight = selectorBudget(m.chrome(), m.height, width)
+	}
+	return m.chrome().View(renderPanel(b.String(), width, panelHeight, m.title), width, m.height)
 }
 
 // renderChoices draws the items in [start,end) with the cursor highlighted.
@@ -251,18 +263,15 @@ func Select(title string, choices []Choice) (int, bool, error) {
 
 func sharedTableStyles() table.Styles {
 	styles := table.DefaultStyles()
-	styles.Header = styles.Header.Bold(true).Foreground(lipgloss.Color("6")).BorderStyle(lipgloss.NormalBorder()).BorderBottom(true)
-	styles.Selected = styles.Selected.Bold(true).Foreground(lipgloss.Color("0")).Background(lipgloss.Color("2"))
+	styles.Header = styles.Header.Foreground(lipgloss.Color("7"))
+	styles.Selected = selectionStyle
 	return styles
 }
 
-// safeSetColumnsRows updates a bubbles table's columns and rows without tripping
-// the table's renderRow panic on mismatched widths.
-//
-// bubbles/table renderRow iterates over the row cells and indexes into columns,
-// so any intermediate state where a row has more cells than there are columns
-// panics (index out of range). Growing the column count therefore requires
-// SetColumns before SetRows, while shrinking requires the reverse order.
+// safeSetColumnsRows updates a table's columns and rows while keeping the two
+// in sync between calls. Growing the column count sets columns before rows;
+// shrinking does the reverse, so an intermediate state never pairs a row with
+// fewer columns than it has cells.
 func safeSetColumnsRows(t *table.Model, cols []table.Column, rows []table.Row) {
 	if len(cols) >= len(t.Columns()) {
 		t.SetColumns(cols)
@@ -314,6 +323,7 @@ type candidateModel struct {
 	candidates        []probe.Candidate
 	table             table.Model
 	width             int
+	height            int
 	selected          int
 	canceled          bool
 	currentInstanceID string
@@ -336,9 +346,11 @@ func (m candidateModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
 	case tea.WindowSizeMsg:
 		m.width = message.Width
-		m.table.SetWidth(max(message.Width, 40))
-		m.table.SetHeight(max(Chrome{}.Budget(message.Height), 3))
-		safeSetColumnsRows(&m.table, candidateColumns(message.Width), candidateRows(m.candidates, message.Width))
+		m.height = message.Height
+		innerWidth := max(message.Width-2, 40)
+		m.table.SetWidth(innerWidth)
+		m.table.SetHeight(max(selectorBudget(m.chrome(), message.Height, message.Width), 2))
+		safeSetColumnsRows(&m.table, candidateColumns(innerWidth), candidateRows(m.candidates, innerWidth))
 		return m, nil
 	case tea.KeyMsg:
 		switch message.String() {
@@ -355,14 +367,11 @@ func (m candidateModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	return m, command
 }
 
-func (m candidateModel) View() string {
-	width := m.width
-	if width <= 0 {
-		width = 80
-	}
+func (m candidateModel) chrome() Chrome {
 	chrome := Chrome{
-		Title: "Select a pivot instance",
-		Info:  fmt.Sprintf("%d/%d · %d candidates", m.table.Cursor()+1, len(m.candidates), len(m.candidates)),
+		Title:     "Select a pivot instance",
+		ShowTitle: true,
+		Info:      fmt.Sprintf("%d/%d · %d candidates", m.table.Cursor()+1, len(m.candidates), len(m.candidates)),
 		Hints: []Hint{
 			{"↑/↓", "move"},
 			{"pgup/pgdn", "jump"},
@@ -374,7 +383,20 @@ func (m candidateModel) View() string {
 		chrome.Title = "Select a new pivot instance"
 		chrome.Info += " · current: " + m.currentInstanceID
 	}
-	return chrome.View(m.table.View(), width, 0) // table height already capped in Update
+	return chrome
+}
+
+func (m candidateModel) View() string {
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	chrome := m.chrome()
+	panelHeight := 0
+	if m.height > 0 {
+		panelHeight = selectorBudget(chrome, m.height, width)
+	}
+	return chrome.View(renderPanel(m.table.View(), width, panelHeight, chrome.Title), width, m.height)
 }
 
 func candidateColumns(width int) []table.Column {
@@ -544,18 +566,18 @@ func (m routeModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		default:
 			heights := routeItemHeights(len(m.routes))
-			m.start, _ = lineWindow(heights, m.cursor, m.start, listBudget(m.height))
+			m.start, _ = lineWindow(heights, m.cursor, m.start, selectorBudget(m.chrome(), m.height, m.width))
 			return m, nil
 		}
 	}
 	heights := routeItemHeights(len(m.routes))
-	m.start, _ = lineWindow(heights, m.cursor, m.start, listBudget(m.height))
+	m.start, _ = lineWindow(heights, m.cursor, m.start, selectorBudget(m.chrome(), m.height, m.width))
 	return m, nil
 }
 
 // pageStep is how far pgup/pgdn jump: the currently visible route count.
 func (m routeModel) pageStep() int {
-	budget := listBudget(m.height)
+	budget := selectorBudget(m.chrome(), m.height, m.width)
 	if budget == math.MaxInt {
 		return len(m.routes)
 	}
@@ -564,8 +586,9 @@ func (m routeModel) pageStep() int {
 
 func (m routeModel) chrome() Chrome {
 	return Chrome{
-		Title: "Select networks to tunnel",
-		Info:  fmt.Sprintf("%d/%d · %d selected", m.cursor+1, len(m.routes), countSelectedRoutes(m.routes)),
+		Title:     "Select networks to tunnel",
+		ShowTitle: true,
+		Info:      fmt.Sprintf("%d/%d · %d selected", m.cursor+1, len(m.routes), countSelectedRoutes(m.routes)),
 		Hints: []Hint{
 			{"↑/↓", "move"},
 			{"pgup/pgdn", "page"},
@@ -595,11 +618,14 @@ func (m routeModel) View() string {
 	var b strings.Builder
 	heights := routeItemHeights(len(m.routes))
 	if len(heights) > 0 {
-		start, end := lineWindow(heights, m.cursor, m.start, m.chrome().Budget(m.height))
+		start, end := lineWindow(heights, m.cursor, m.start, selectorBudget(m.chrome(), m.height, m.width))
 		b.WriteString(renderRoutes(m.routes, m.cursor, start, end))
-		b.WriteString("\n")
 	}
-	return m.chrome().View(b.String(), width, m.height)
+	panelHeight := 0
+	if m.height > 0 {
+		panelHeight = selectorBudget(m.chrome(), m.height, width)
+	}
+	return m.chrome().View(renderPanel(b.String(), width, panelHeight, m.chrome().Title), width, m.height)
 }
 
 // renderRoutes draws the routes in [start,end). Line counts must stay

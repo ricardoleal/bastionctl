@@ -16,10 +16,12 @@
 package dnsresolver
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -45,6 +47,16 @@ type Options struct {
 	LookPath       func(name string) (string, error)
 	TerminalIn     bool
 	EUID           int
+	// PasswordPrompt, when set, is called when sudo needs a typed password
+	// outside an interactive terminal (the TUI case). attempt is 1-based
+	// and reason describes the previous failure ("", "incorrect password").
+	// Returning an error cancels the whole authorization attempt.
+	PasswordPrompt func(attempt int, reason string) (string, error)
+	// validateSudo runs `sudo -S -p '' -v` to (re)build a cached sudo
+	// credential without owning a tty. An empty password keeps stdin open
+	// (the Touch ID probe); a non-empty password is piped. Replaceable in
+	// tests.
+	validateSudo func(timeout time.Duration, password string) ([]byte, error)
 }
 
 // DefaultOptions builds the real execution environment for the running OS.
@@ -55,9 +67,10 @@ func DefaultOptions() *Options {
 		Run: func(name string, args ...string) ([]byte, error) {
 			return exec.Command(name, args...).CombinedOutput()
 		},
-		LookPath:   exec.LookPath,
-		TerminalIn: term.IsTerminal(int(os.Stdin.Fd())),
-		EUID:       os.Geteuid(),
+		LookPath:     exec.LookPath,
+		TerminalIn:   term.IsTerminal(int(os.Stdin.Fd())),
+		EUID:         os.Geteuid(),
+		validateSudo: defaultValidateSudo,
 	}
 	return o
 }
@@ -201,8 +214,9 @@ func (o *Options) sudoPrefix() []string {
 
 // runSudo runs a system configuration command, inserting "sudo" when the
 // process is not already running as root. Before the first sudo use it
-// fails fast when no interactive terminal is attached (a prompt with no TTY
-// would otherwise wedge or fail confusingly).
+// makes sure authorization is possible: on an interactive terminal sudo
+// prompts itself (Touch ID → password), and in the TUI it probes Touch ID
+// and falls back to the in-app password prompt via PasswordPrompt.
 func (o *Options) runSudo(name string, args ...string) ([]byte, error) {
 	if !o.needsSudo() {
 		return o.run(name, args...)
@@ -226,7 +240,85 @@ func (o *Options) ensureSudoUsable() error {
 	if o.TerminalIn {
 		return nil // sudo can prompt for a password; let it.
 	}
+	if o.PasswordPrompt != nil {
+		return o.ensureSudoInApp()
+	}
 	return fmt.Errorf("%w: sudo has no cached timestamp and there is no terminal to prompt in — run `sudo -v` in the terminal running bastionctl, then start the connection again", ErrSudoUnavailable)
+}
+
+// In-app sudo authorization parameters.
+const (
+	// The Touch ID probe waits for the user to touch the sensor; macOS
+	// dismisses its panel itself after a few seconds, so no long hang.
+	sudoTouchProbeTimeout = 8 * time.Second
+	// A typed password authenticates immediately or fails fast; sudo
+	// reads exactly one line from Stdin.
+	sudoPasswordTimeout  = 30 * time.Second
+	sudoMaxPasswordTries = 3
+)
+
+// ensureSudoInApp acquires a cached sudo credential from inside the TUI:
+// macOS Touch ID gets the first chance — sudo still goes through PAM, so
+// the system panel handles the fingerprint and no password is ever typed
+// — and only when biometrics are unavailable (or declined) does the
+// in-app password field run. A successful `sudo -v` caches the credential
+// for this process, so later `sudo -n` calls in ensureSudoUsable and the
+// actual runSudo commands succeed silently.
+func (o *Options) ensureSudoInApp() error {
+	if o.GoOS == "darwin" {
+		// p "" keeps stdin open without writing anything: pam_tid engages
+		// the macOS Touch ID panel and succeeds or fails without reading
+		// our no-op line. The timeout bounds systems without Touch ID.
+		if _, err := o.validateSudo(sudoTouchProbeTimeout, ""); err == nil {
+			return nil
+		}
+		if _, err := o.Run("sudo", "-n", "true"); err == nil {
+			return nil // granted while the probe was pending.
+		}
+	}
+	reason := ""
+	var lastErr error
+	for attempt := 1; attempt <= sudoMaxPasswordTries; attempt++ {
+		password, err := o.PasswordPrompt(attempt, reason)
+		if err != nil {
+			return fmt.Errorf("sudo authorization cancelled: %w", err)
+		}
+		output, verr := o.validateSudo(sudoPasswordTimeout, password)
+		if verr == nil {
+			return nil
+		}
+		lastErr = fmt.Errorf("sudo: %w: %s", verr, strings.TrimSpace(string(output)))
+		reason = "incorrect password"
+	}
+	return lastErr
+}
+
+// defaultValidateSudo runs `sudo -S -p "" -v` with no tty: -S reads the
+// password from stdin, and -v validates it and caches the credential
+// without running a command. An empty password keeps stdin open for the
+// Touch ID probe; a non-empty one is piped before Start, which cannot
+// deadlock because a single line fits the pipe buffer with room to spare.
+func defaultValidateSudo(timeout time.Duration, password string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sudo", "-S", "-p", "", "-v")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	if password != "" {
+		if _, err := io.WriteString(stdin, password+"\n"); err != nil {
+			_ = stdin.Close()
+			return nil, err
+		}
+		_ = stdin.Close()
+	}
+	out, verr := cmd.CombinedOutput()
+	_ = stdin.Close() // releases the probe reader; double-close is ignored
+	if ctx.Err() != nil {
+		return out, context.DeadlineExceeded
+	}
+	return out, verr
 }
 
 // sudoHint prefixes printed instructions with "sudo " when applicable.
